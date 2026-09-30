@@ -1,0 +1,12 @@
+{
+  "proxy": "",
+  "projects": {
+    "demo": "/absolute/path/to/your/project"
+  },
+  "execution_enabled": false,
+  "chat_id": null,
+  "user_id": null,
+  "bot_id": null,
+  "bot_username": "",
+  "new_thread_defaults": {}
+}

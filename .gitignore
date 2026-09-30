@@ -1,0 +1,41 @@
+# Credentials and personal runtime configuration (at any depth)
+token
+token.*
+settings.json
+settings.tmp
+projects.json
+original-notify.json
+config.toml
+config.before*
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+
+# Chat history, queue state, receipts, logs and local backups
+*.sqlite
+*.sqlite3
+*.sqlite*
+*.db
+*.db-*
+*.jsonl
+*.log
+*.lock
+*.tmp
+backups/
+verification/
+assets/
+
+# Python and editor artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+.DS_Store
+.idea/
+.vscode/
