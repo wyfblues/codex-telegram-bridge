@@ -82,6 +82,8 @@ def db():
       CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY, text TEXT, state TEXT,
         receipt INTEGER, next_try REAL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS cursors(path TEXT PRIMARY KEY, offset INTEGER);
+      CREATE TABLE IF NOT EXISTS completion_cursors(thread TEXT PRIMARY KEY,
+        path TEXT NOT NULL, offset INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS reply_jobs(job_id INTEGER PRIMARY KEY, thread TEXT, cwd TEXT);
       CREATE TABLE IF NOT EXISTS keyboards(id TEXT PRIMARY KEY, markup TEXT);
       CREATE TABLE IF NOT EXISTS choices(token TEXT PRIMARY KEY, project TEXT, thread TEXT,
@@ -1507,6 +1509,17 @@ def setup(existing=False, existing_proxy=None):
     raise RuntimeError('Pairing expired')
 
 
+def completion_time(value):
+    """Accept only dated, timezone-aware completion events from rollout records."""
+    if not isinstance(value, str):
+        return None
+    try:
+        stamp = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        return stamp if stamp.tzinfo is not None else None
+    except ValueError:
+        return None
+
+
 def notify(payload, trusted=False):
     """Forward the final answer requested by the owner, excluding input and tool logs."""
     if payload.get('type') != 'agent-turn-complete':
@@ -1523,9 +1536,11 @@ def notify(payload, trusted=False):
     result = payload.get('last-assistant-message')
     if not isinstance(result, str) or not result.strip():
         result = '（本轮没有提供最终答复文本）'
+    completed = completion_time(payload.get('completed-at')) if trusted else None
+    when = completed.astimezone(ZoneInfo('Asia/Shanghai')).strftime('%m-%d %H:%M') if completed else clock_text()
     with db() as c:
         queue(c, f'notice:{thread}:{turn}',
-              f'【Codex】{project}{title}\n会话 {thread[:8]} · 本轮已结束\n{clock_text()}\n\n{result}')
+              f'【Codex】{project}{title}\n会话 {thread[:8]} · 本轮已结束\n{when}\n\n{result}')
 
 
 def baseline_completions():
@@ -1534,13 +1549,14 @@ def baseline_completions():
         if get(c, 'monitor_since'):
             return
         with closing(sqlite3.connect(f'file:{THREAD_DB}?mode=ro', uri=True, timeout=2)) as src:
-            paths = src.execute("SELECT rollout_path FROM threads WHERE source IN ('vscode','cli','exec')").fetchall()
-        for (path,) in paths:
+            paths = src.execute("SELECT id,rollout_path FROM threads WHERE source IN ('vscode','cli','exec')").fetchall()
+        for thread, path in paths:
             try:
                 size = Path(path).stat().st_size
             except OSError:
                 continue
             c.execute('INSERT OR REPLACE INTO cursors VALUES (?,?)', (path, size))
+            c.execute('INSERT OR REPLACE INTO completion_cursors VALUES (?,?,?)', (thread, path, size))
         put(c, 'monitor_since', int(time.time()) - 1)
 
 
@@ -1552,8 +1568,21 @@ def scan_completions():
         rows = src.execute("SELECT id,cwd,rollout_path FROM threads WHERE updated_at>=? AND source IN ('vscode','cli','exec')", (since,)).fetchall()
     for thread, cwd, path in rows:
         with db() as c:
-            row = c.execute('SELECT offset FROM cursors WHERE path=?', (path,)).fetchone()
-            offset = row[0] if row else 0
+            row = c.execute('SELECT offset FROM completion_cursors WHERE thread=?', (thread,)).fetchone()
+            if row is None:
+                # Upgrade the existing path-based checkpoint, including archived files.
+                row = c.execute('SELECT offset FROM cursors WHERE path=?', (path,)).fetchone()
+                if row is None:
+                    candidates = c.execute('SELECT path,offset FROM cursors WHERE path LIKE ?',
+                                           ('%-' + thread + '.jsonl',)).fetchall()
+                    offsets = [r['offset'] for r in candidates
+                               if Path(r['path']).name.endswith('-' + thread + '.jsonl')]
+                    offset = max(offsets, default=0)
+                else:
+                    offset = row[0]
+            else:
+                offset = row[0]
+            c.execute('INSERT OR REPLACE INTO completion_cursors VALUES (?,?,?)', (thread, path, offset))
         try:
             with open(path, 'rb') as f:
                 if os.fstat(f.fileno()).st_size == offset:
@@ -1574,13 +1603,20 @@ def scan_completions():
                         continue
                     payload = event.get('payload', {})
                     if event.get('type') == 'event_msg' and payload.get('type') == 'task_complete':
+                        completed = completion_time(event.get('timestamp'))
+                        # updated_at also changes when viewing or archiving a conversation.
+                        # It cannot establish when its individual tasks actually completed.
+                        if completed is None or completed.timestamp() < since:
+                            continue
                         notify({'type': 'agent-turn-complete', 'thread-id': thread,
                                 'turn-id': payload.get('turn_id'), 'cwd': cwd,
+                                'completed-at': event['timestamp'],
                                 'last-assistant-message': payload.get('last_agent_message')}, trusted=True)
         except OSError:
             continue
         with db() as c:
             c.execute('INSERT OR REPLACE INTO cursors VALUES (?,?)', (path, offset))
+            c.execute('INSERT OR REPLACE INTO completion_cursors VALUES (?,?,?)', (thread, path, offset))
 
 
 if __name__ == '__main__':

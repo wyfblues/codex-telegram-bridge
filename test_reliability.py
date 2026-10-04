@@ -94,7 +94,7 @@ class ReliabilityTests(unittest.TestCase):
         return b.thread_metadata(thread)
 
     def append_event(self, path, turn, kind='task_complete', answer='Final answer'):
-        event = {'type': 'event_msg', 'timestamp': '2026-09-30T12:00:00Z',
+        event = {'type': 'event_msg', 'timestamp': b.datetime.now(b.ZoneInfo('UTC')).isoformat(),
                  'payload': {'type': kind, 'turn_id': turn, 'last_agent_message': answer}}
         with Path(path).open('a') as f:
             f.write(json.dumps(event) + '\n')

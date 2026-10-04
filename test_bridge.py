@@ -94,7 +94,8 @@ class BridgeTests(unittest.TestCase):
     def test_observer_baseline_partial_records_dedupe_and_subagent_filter(self):
         log = b.ROOT / 'events.jsonl'
         def event(turn):
-            return json.dumps({'type': 'event_msg', 'payload': {'type': 'task_complete', 'turn_id': turn, 'last_agent_message': '监听结果正文'}}) + '\n'
+            return json.dumps({'type': 'event_msg', 'timestamp': b.datetime.now(b.ZoneInfo('UTC')).isoformat(),
+                               'payload': {'type': 'task_complete', 'turn_id': turn, 'last_agent_message': '监听结果正文'}}) + '\n'
         log.write_text(event('historical'))
         with closing(sqlite3.connect(b.THREAD_DB)) as c, c:
             c.execute('INSERT INTO threads(id,source,cwd,rollout_path,updated_at) VALUES (?,?,?,?,?)', ('primary', 'vscode', '/tmp/demo', str(log), int(time.time())))
