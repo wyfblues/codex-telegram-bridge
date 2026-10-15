@@ -44,31 +44,50 @@ workflow a Telegram entry point, with a few deliberate choices:
 
 </details>
 
-## How does it compare with official Codex on mobile?
+## Why build this when official Codex on mobile already exists?
 
-The official app already supports local conversations, progress, notifications,
-and attachments. It also offers command approvals, code diffs, and guidance for
-work that is already running. Those are useful reasons to choose it.
-Sources: [mobile guide](https://learn.chatgpt.com/docs/mobile),
-[remote connections](https://learn.chatgpt.com/docs/remote-connections), and
-[mobile workflow guide](https://learn.chatgpt.com/blog/mastering-codex-remote-for-engineering).
+After using Codex through ChatGPT for a long time, my biggest frustration is the
+stop-start remote connection. Sooner or later, it fails to connect. Even checking
+a result or sending a short follow-up means waiting for the connection first.
+It's a frustrating experience.
 
-| Your workflow | Official Codex on mobile | This bridge |
+**I wanted a more direct way: open Telegram, send a message, get the result.**
+This bridge does not depend on the official mobile-to-computer Remote connection.
+With your Mac awake and online, and the bridge and Codex available, you can
+follow your local Codex work through Telegram.
+
+- **Skip the wait for official Remote to connect.** After pairing, Telegram is
+  all you need on your phone. You can send a follow-up without first opening
+  ChatGPT and checking whether it has connected to your computer.
+- **Reply where the result arrives.** Full answers come into the chat. Reply to
+  a result to continue its original conversation, even after switching projects,
+  without finding and selecting the original project and conversation again.
+- **Follow progress without a stream of messages.** An optional card updates
+  in place; the complete result arrives separately. Check in when you have a
+  moment and pick up the conversation when the work is done.
+- **Make the workflow your own.** You control the bridge and its source, so you
+  can change notifications, conversation routing, and image-retention rules.
+  Images have previews, original-file delivery, and automatic copy cleanup.
+
+| Everyday concern | Official Codex on mobile | What this bridge gives you |
 | --- | --- | --- |
-| Where you work from | Codex in the ChatGPT mobile app | A paired private Telegram chat |
-| Where tasks run | Cloud or a connected Mac or Windows computer | Configured projects on your Mac |
-| Continue an existing conversation | Supported | Supported; replying to a delivered result selects its original conversation |
-| Follow progress and results | Task views and notifications | One updating progress card and full answers in the chat |
-| Approve commands and review code | Approval controls, changed files, and diffs | Text and image results; no approval or dedicated diff interface |
-| Guide an active task | Queue and steering controls | Follow up after the task ends; no live steering or user-managed backlog |
-| Set it up and maintain it | Pair supported devices in the official apps | Run your own Python service and maintain compatibility with Codex |
+| Follow work on your own computer | Connect to the computer and open a task in ChatGPT | Send and receive in a Telegram private chat, independently of official Remote connection status |
+| What the phone needs | ChatGPT, the same account and workspace, and device pairing | A Telegram account paired with the bot; Codex stays signed in on the Mac |
+| Continue after receiving a result | Continue in the corresponding task | Reply directly to the result to return to its original conversation |
+| Check progress | Task views and notifications | One updating card, with complete answers kept in chat history |
+| Adapt the experience | Features and settings provided by the official app | Python standard-library source you can maintain and adapt for notifications and image handling |
 
-Choose the official app when you want to review code, handle approvals, or manage
-active work from your phone. Choose this bridge when you mainly want to receive
-results and send follow-ups in Telegram, and are comfortable maintaining a local
-service. Both ways of working on your own computer need that host awake and
-online. Messages and attached images sent through this bridge pass through
-Telegram.
+This is the workflow the project is built for: **Codex on the computer, Telegram
+on the phone for results, screenshots, and follow-ups.** The official mobile app
+remains useful for approvals, code diffs, and steering active work. See the
+[mobile guide](https://learn.chatgpt.com/docs/mobile),
+[remote connections](https://learn.chatgpt.com/docs/remote-connections), and
+[mobile workflow guide](https://learn.chatgpt.com/blog/mastering-codex-remote-for-engineering)
+for those capabilities.
+
+You need to deploy and maintain the bridge yourself. It still needs an available
+Mac and Telegram connection: sleep, network loss, or a stopped bridge prevents
+new tasks from being processed. Messages and images pass through Telegram.
 
 ## How does it compare with other Telegram bridges?
 
