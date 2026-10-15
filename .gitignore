@@ -28,6 +28,8 @@ config.before*
 backups/
 verification/
 assets/
+media/
+incoming/
 
 # Python and editor artifacts
 __pycache__/

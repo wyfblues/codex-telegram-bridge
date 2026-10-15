@@ -18,6 +18,9 @@ import urllib.request
 from datetime import datetime
 from contextlib import closing, contextmanager
 from zoneinfo import ZoneInfo
+import image_delivery as images
+import image_receive as received_images
+import image_retention as retention
 
 ROOT = Path(__file__).resolve().parent
 CODEX = os.environ.get('CODEX_CLI', '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex')
@@ -84,6 +87,14 @@ def db():
       CREATE TABLE IF NOT EXISTS cursors(path TEXT PRIMARY KEY, offset INTEGER);
       CREATE TABLE IF NOT EXISTS completion_cursors(thread TEXT PRIMARY KEY,
         path TEXT NOT NULL, offset INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS outbox_media(id TEXT PRIMARY KEY, path TEXT NOT NULL,
+        name TEXT NOT NULL, mime TEXT NOT NULL, sha256 TEXT NOT NULL,
+        size INTEGER NOT NULL, mode TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS media_tokens(token TEXT PRIMARY KEY, media_id TEXT UNIQUE NOT NULL);
+      CREATE TABLE IF NOT EXISTS job_photos(job_id INTEGER PRIMARY KEY, file_id TEXT,
+        path TEXT, sha256 TEXT, size INTEGER, mime TEXT, received REAL NOT NULL);
+      CREATE TABLE IF NOT EXISTS image_retention(path TEXT PRIMARY KEY, kind TEXT NOT NULL,
+        last_used REAL NOT NULL, expired_at REAL);
       CREATE TABLE IF NOT EXISTS reply_jobs(job_id INTEGER PRIMARY KEY, thread TEXT, cwd TEXT);
       CREATE TABLE IF NOT EXISTS keyboards(id TEXT PRIMARY KEY, markup TEXT);
       CREATE TABLE IF NOT EXISTS choices(token TEXT PRIMARY KEY, project TEXT, thread TEXT,
@@ -130,6 +141,148 @@ def message_parts(text, limit=3400):
     if chars:
         parts.append(''.join(chars))
     return parts or ['（无文本内容）']
+
+
+def image_config():
+    try:
+        return config().get('image_delivery_enabled') is True
+    except (OSError, ValueError):
+        return False
+
+
+def track_image(c, path, kind, used_at=None):
+    """Track only our own copies; fresh references renew a shared content hash."""
+    info = retention.inspect(ROOT, path, kind)
+    if not info['exists']:
+        return
+    used_at = time.time() if used_at is None else used_at
+    c.execute('''INSERT INTO image_retention VALUES (?,?,?,NULL)
+                 ON CONFLICT(path) DO UPDATE SET kind=excluded.kind,
+                 last_used=MAX(image_retention.last_used,excluded.last_used),expired_at=NULL''',
+              (str(path), kind, max(used_at, info['mtime'])))
+
+
+def original_expired(c, media):
+    row = c.execute('SELECT * FROM image_retention WHERE path=?', (media['path'],)).fetchone()
+    try:
+        info = retention.inspect(ROOT, media['path'], 'media')
+    except retention.RetentionError:
+        return True
+    if not info['exists'] or (row and row['expired_at'] is not None):
+        return True
+    last_used = max(row['last_used'] if row else info['mtime'], info['mtime'])
+    return time.time() - last_used >= retention.RETENTION_DAYS['media'] * retention.DAY
+
+
+def cleanup_images(cfg, now=None):
+    """One serialized local maintenance pass; errors never stop message handling."""
+    if not cfg.get('image_cleanup_enabled'):
+        return None
+    now = time.time() if now is None else now
+    active, unknown = running_threads()
+    if unknown:
+        raise OSError('Cannot establish active image consumers')
+    active_ids = {meta['id'] for meta in active}
+    with db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        active_ids.update(row[0] for row in c.execute("""SELECT thread FROM jobs
+            WHERE state IN ('queued','running') AND thread IS NOT NULL"""))
+        protected = {row[0] for row in c.execute('''SELECT p.path FROM job_photos p
+            JOIN jobs j ON j.id=p.job_id WHERE j.state IN ('queued','running') AND p.path IS NOT NULL''')}
+        protected.update(row[0] for row in c.execute('''SELECT m.path FROM outbox_media m
+            JOIN outbox o ON o.id=m.id WHERE o.state IN ('pending','sending','uncertain')'''))
+        for row in c.execute('SELECT p.path,j.thread FROM job_photos p JOIN jobs j ON j.id=p.job_id'):
+            if row['thread'] in active_ids and row['path']:
+                protected.add(row['path'])
+        for row in c.execute('SELECT id,path FROM outbox_media'):
+            parts = row['id'].split(':')
+            if len(parts) >= 3 and parts[0] in ('notice','last','result-backfill') and parts[1] in active_ids:
+                protected.add(row['path'])
+        # Backfill legacy/orphan snapshots; discovery never leaves the private cache directories.
+        for copy in retention.discover(ROOT):
+            c.execute('''INSERT INTO image_retention VALUES (?,?,?,NULL)
+                ON CONFLICT(path) DO UPDATE SET last_used=MAX(image_retention.last_used,excluded.last_used),
+                expired_at=CASE WHEN excluded.last_used>COALESCE(image_retention.expired_at,excluded.last_used)
+                    THEN NULL ELSE image_retention.expired_at END''',
+                      (copy['path'],copy['kind'],copy['last_used']))
+        candidates = [dict(row) for row in c.execute('SELECT * FROM image_retention WHERE expired_at IS NULL')]
+        result = retention.clean(ROOT, candidates, protected, now)
+        for path in result['expired']:
+            c.execute('UPDATE image_retention SET expired_at=? WHERE path=?', (now,path))
+        put(c,'cleanup:last',now)
+        put(c,'cleanup:deleted',len(result['deleted']))
+        put(c,'cleanup:bytes',result['bytes'])
+        put(c,'cleanup:errors',len(result['errors']))
+    return result
+
+
+def queue_media(c, key, media, mode, caption):
+    if c.execute('SELECT 1 FROM outbox WHERE id=?', (key,)).fetchone():
+        return
+    track_image(c, media['path'], 'media')
+    markup = None
+    if mode == 'photo':
+        token = secrets.token_urlsafe(18)
+        c.execute('INSERT INTO media_tokens VALUES (?,?)', (token, key))
+        markup = {'inline_keyboard': [[{'text': '发送原图', 'callback_data': 'original:' + token}]]}
+    queue(c, key, caption[:450], markup)
+    c.execute('INSERT INTO outbox_media VALUES (?,?,?,?,?,?,?)',
+              (key, media['path'], media['name'], media['mime'], media['sha256'], media['size'], mode))
+
+
+def queue_answer_images(c, key, result, caption, completed=None):
+    if not image_config():
+        return
+    if not c.in_transaction:
+        c.execute('BEGIN IMMEDIATE')
+    since = float(get(c, 'image_delivery_since', '0'))
+    if not since:
+        since = time.time() - 1
+        put(c, 'image_delivery_since', since)
+    if completed is not None and completed.timestamp() < since:
+        return
+    delivered = set()
+    references = list(images.image_references(result))
+    for index, (source, requested_mode) in enumerate(references[:images.IMAGE_LIMIT]):
+        try:
+            media = images.snapshot_image(ROOT, source)
+            mode = requested_mode if media['preview'] else 'document'
+            identity = (media['sha256'], mode)
+            if identity in delivered:
+                continue
+            delivered.add(identity)
+            media_key = key + ':media:' + media['sha256'] + ':' + mode
+            label = '图片预览' if mode == 'photo' else '原图文件'
+            queue_media(c, media_key, media, mode, f'{caption}\n{label} · {media["name"]}')
+        except (images.ImageError, retention.RetentionError) as e:
+            detail = str(e) if isinstance(e, images.ImageError) else '图片副本无法安全读取。'
+            queue(c, key + ':media-error:' + str(index), '图片未发送：' + detail)
+    if len(references) > images.IMAGE_LIMIT:
+        queue(c, key + ':media-limit', f'本轮图片超过 {images.IMAGE_LIMIT} 张，其余图片请分批交付。')
+
+
+def original_callback(c, callback, token):
+    stored = c.execute('SELECT media_id FROM media_tokens WHERE token=?', (token,)).fetchone()
+    if not stored or not valid_menu(c, stored['media_id'], callback['message'].get('message_id')):
+        return '无法验证这张图片，请使用已发送图片下的按钮。'
+    media = c.execute('SELECT * FROM outbox_media WHERE id=?', (stored['media_id'],)).fetchone()
+    if not media:
+        return '原图记录不存在，请在原会话重新交付。'
+    key = stored['media_id'].replace(':media:', ':original:', 1)
+    previous = c.execute('SELECT state FROM outbox WHERE id=?', (key,)).fetchone()
+    if previous and previous['state'] in ('pending','sending','uncertain'):
+        return ('原图送达状态待确认；为避免重复发送，请先检查聊天记录。'
+                if previous['state'] == 'uncertain' else '原图正在排队或发送，请稍候。')
+    if original_expired(c, media):
+        return '原图本机副本已过期或已清理（保留 30 天），请在原会话重新提供图片。已发送的原图可在聊天记录中查看。'
+    if previous:
+        if previous['state'] == 'sent':
+            return '原图已发送，请在聊天记录中查看；重复点击不会重发。'
+        if previous['state'] == 'failed':
+            return '原图发送失败，请在原会话重新交付图片。'
+        return '原图正在排队或发送，请稍候。'
+    queue_media(c, key, media, 'document', '原图文件 · ' + media['name'])
+    return '原图已入队；同一张图片重复点击不会重复发送。'
 
 
 def queue(c, key, text, markup=None):
@@ -184,6 +337,7 @@ class API:
     def __init__(self, cfg):
         token = (ROOT / 'token').read_text().strip()
         self.base = 'https://api.telegram.org/bot' + token + '/'
+        self.file_base = 'https://api.telegram.org/file/bot' + token + '/'
         proxy = cfg.get('proxy')
         self.http = urllib.request.build_opener(urllib.request.ProxyHandler(
             {'https': proxy} if proxy else {}))
@@ -191,8 +345,26 @@ class API:
     def call(self, method, **payload):
         request = urllib.request.Request(self.base + method,
             data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json'})
+        return self.request(request)
+
+    def upload(self, method, field, data, filename, mime, **payload):
+        boundary = 'codex-' + secrets.token_hex(24)
+        parts = []
+        for key, value in payload.items():
+            encoded = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
+            parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n'
+                          + encoded + '\r\n').encode())
+        filename = re.sub(r'[\x00-\x1f\x7f"\\]', '_', filename)
+        parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"; '
+                      f'filename="{filename}"\r\nContent-Type: {mime}\r\n\r\n').encode())
+        parts.extend([data, f'\r\n--{boundary}--\r\n'.encode()])
+        request = urllib.request.Request(self.base + method, data=b''.join(parts),
+            headers={'Content-Type': 'multipart/form-data; boundary=' + boundary})
+        return self.request(request, timeout=120)
+
+    def request(self, request, timeout=40):
         try:
-            with self.http.open(request, timeout=40) as response:
+            with self.http.open(request, timeout=timeout) as response:
                 data = json.load(response)
         except urllib.error.HTTPError as e:
             try:
@@ -203,6 +375,25 @@ class API:
             raise Rejected(data.get('error_code'), data.get('parameters', {}).get('retry_after', 0),
                            'message is not modified' in data.get('description','').lower())
         return data['result']
+
+    def download_photo(self, file_id):
+        info = self.call('getFile', file_id=file_id)
+        path = info.get('file_path', '')
+        if (not isinstance(path, str) or not path or path.startswith('/')
+                or any(part in ('.', '..', '') for part in path.split('/'))
+                or re.fullmatch(r'[A-Za-z0-9_./-]+', path) is None):
+            raise received_images.PhotoError('图片下载地址无效，请重新发送。')
+        if info.get('file_size', 0) > received_images.PHOTO_LIMIT:
+            raise received_images.PhotoError('图片超过 20 MB，请缩小后再发送。')
+        request = urllib.request.Request(self.file_base + path)
+        with self.http.open(request, timeout=40) as response:
+            length = response.headers.get('Content-Length')
+            if length and int(length) > received_images.PHOTO_LIMIT:
+                raise received_images.PhotoError('图片超过 20 MB，请缩小后再发送。')
+            data = response.read(received_images.PHOTO_LIMIT + 1)
+        if len(data) > received_images.PHOTO_LIMIT:
+            raise received_images.PhotoError('图片超过 20 MB，请缩小后再发送。')
+        return data
 
 
 def authorized(cfg, message):
@@ -330,6 +521,8 @@ def select_callback(c, cfg, callback):
             or message.get('from', {}).get('id') != cfg.get('bot_id')):
         return '无权操作。'
     data = callback.get('data', '')
+    if data.startswith('original:'):
+        return original_callback(c, callback, data[9:])
     if data.startswith('action:'):
         return navigation_callback(c,cfg,callback,data[7:])
     token = data[8:] if data.startswith('session:') else ''
@@ -484,6 +677,9 @@ def health_text(c,cfg):
         return f'{max(0,int(time.time()-float(value)))} 秒前' if value else '尚未完成'
     lines = ['【机器人健康状态】', '服务在线，已绑定私人账号。',
              '远程执行：'+('已启用' if cfg.get('execution_enabled') else '已停用'),
+             '图片发送：'+('已启用' if cfg.get('image_delivery_enabled') else '已停用'),
+             '图片接收：'+('已启用（单张图片＋说明）' if cfg.get('image_receive_enabled') else '已停用'),
+             '图片清理：'+('已启用（接收 7 天／原图 30 天，每小时检查）' if cfg.get('image_cleanup_enabled') else '已停用'),
              '上次成功接收检查：'+age('health:poll'),
              '上次成功扫描任务：'+age('health:observer'),
              '上次发送检查：'+age('health:sender'),
@@ -499,6 +695,10 @@ def health_text(c,cfg):
                  f"失败 {counts.get('failed',0)}，送达待确认 {counts.get('uncertain',0)}")
     if counts.get('failed') or counts.get('uncertain'):
         lines.append('可选中会话后用 /last 补看结果。')
+    if get(c,'cleanup:last'):
+        lines.append('上次图片清理：'+age('cleanup:last')+'，删除 '+get(c,'cleanup:deleted','0')+' 个副本。')
+    if get(c,'cleanup:errors','0') != '0' or get(c,'health:cleanup:error'):
+        lines.append('图片清理最近遇到异常，收发服务继续运行，下次定时检查。')
     lines.append('电脑睡眠或离线时无法接收命令；超过 15 分钟的指令不会自动执行。')
     return '\n'.join(lines)
 
@@ -808,6 +1008,30 @@ def resume_arguments(meta):
     return args
 
 
+def accept_photo(c, cfg, uid, message):
+    if not cfg.get('image_receive_enabled'):
+        return '图片接收尚未启用，目前请发送文字指令。'
+    if not cfg.get('execution_enabled'):
+        return '远程执行尚未启用。'
+    try:
+        photo = received_images.validate_photo(message)
+    except received_images.PhotoError as error:
+        return str(error)
+    if 'reply_to_message' in message or 'external_reply' in message:
+        target = resolve_reply(c, cfg, message)
+        error = '这张图片未关联到可继续的原会话，请回复机器人完成通知并附上单张图片和说明。'
+    else:
+        target, error = current_target(c, cfg)
+    if not target:
+        return error + '\n请先选择一条已有会话，再发送图片和说明。'
+    reply = enqueue_existing(c, cfg, uid, photo['caption'], target)
+    if c.execute('SELECT 1 FROM jobs WHERE id=?', (uid,)).fetchone():
+        c.execute('INSERT INTO job_photos(job_id,file_id,received) VALUES (?,?,?)',
+                  (uid, photo['file_id'], message['date']))
+        reply += '\n已接收单张图片和说明，将读取图片后回答。'
+    return reply
+
+
 def accept(cfg, update):
     """Persist command and offset atomically; never execute an update twice."""
     uid = update['update_id']
@@ -819,6 +1043,11 @@ def accept(cfg, update):
         if 'callback_query' in update:
             return select_callback(c, cfg, update['callback_query'])
         if not authorized(cfg, m):
+            return
+        if 'photo' in m or 'media_group_id' in m:
+            reply = ('这条消息已超过 15 分钟，未自动执行。请重新发送。'
+                     if time.time() - m.get('date', 0) > 900 else accept_photo(c, cfg, uid, m))
+            queue(c, 'reply:' + str(uid), reply)
             return
         text = m.get('text', '').strip()
         if text.startswith('/'):
@@ -915,10 +1144,24 @@ def deliver(api, cfg):
         c.execute("UPDATE outbox SET state='sending' WHERE id=?", (row['id'],))
         keyboard = c.execute('SELECT markup FROM keyboards WHERE id=?', (row['id'],)).fetchone()
         edit=c.execute('SELECT target FROM message_edits WHERE id=?',(row['id'],)).fetchone()
+        media = c.execute('SELECT * FROM outbox_media WHERE id=?', (row['id'],)).fetchone()
     state, receipt, retry = 'uncertain', None, 0
     try:
         extra = {'reply_markup': json.loads(keyboard['markup'])} if keyboard else {}
-        if edit:
+        if media:
+            data = images.upload_bytes(ROOT, media)
+            method, field = ('sendPhoto', 'photo') if media['mode'] == 'photo' else ('sendDocument', 'document')
+            try:
+                result = api.upload(method, field, data, media['name'], media['mime'],
+                                    chat_id=cfg['chat_id'], caption=row['text'], **extra)
+            except Rejected as e:
+                if media['mode'] != 'photo' or e.code != 400:
+                    raise
+                # A definite photo rejection is safe to deliver as the original file.
+                result = api.upload('sendDocument', 'document', data, media['name'], media['mime'],
+                                    chat_id=cfg['chat_id'], caption=row['text'] + '\n预览不可用，已发送原图。')
+            receipt = result['message_id']
+        elif edit:
             api.call('editMessageText',chat_id=cfg['chat_id'],message_id=edit['target'],
                      text=row['text'],reply_markup=json.loads(keyboard['markup']) if keyboard else {'inline_keyboard':[]})
             receipt=edit['target']
@@ -926,6 +1169,8 @@ def deliver(api, cfg):
             result = api.call('sendMessage', chat_id=cfg['chat_id'], text=row['text'], **extra)
             receipt = result['message_id']
         state = 'sent'
+    except images.ImageError:
+        state = 'failed'
     except Rejected as e:
         if edit and e.not_modified:
             state,receipt='sent',edit['target']
@@ -937,6 +1182,13 @@ def deliver(api, cfg):
     with db() as c:
         c.execute('UPDATE outbox SET state=?,receipt=?,next_try=? WHERE id=?',
                   (state, receipt, retry, row['id']))
+        if media and state == 'sent':
+            try:
+                track_image(c, media['path'], 'media')
+            except retention.RetentionError:
+                pass  # Retention bookkeeping must not lose an acknowledged delivery.
+        if media and state == 'failed':
+            queue(c, row['id'] + ':error', '图片发送失败，请在原会话重新交付图片；文字答复不受影响。')
         if state=='sent' and keyboard:
             c.execute('INSERT OR REPLACE INTO menu_versions VALUES (?,?)',(receipt,row['id']))
         elif state=='failed' and edit:
@@ -949,6 +1201,9 @@ def deliver(api, cfg):
 
 
 FAILURES = {
+    'CANCELLED':'任务已取消，本次未执行。',
+    'IMAGE_DOWNLOAD_FAILED':'图片下载失败，本次未执行；请检查连接后重新发送图片和说明。',
+    'IMAGE_UNAVAILABLE':'图片接收副本无法读取或已变化，本次未执行；请重新发送图片和说明。',
     'DESKTOP_OFFLINE':'Codex 桌面端未运行或无法确认，请先在电脑上打开 Codex。',
     'EXPIRED':'指令已等待超过 15 分钟，未提交执行，请重新发送。',
     'WRITER_BUSY':'原会话仍由 Codex 桌面端或另一进程持有，当前 CLI 无法接管。请在桌面继续原会话；也可用 /new 明确新建独立会话（不会继承原会话上下文）。',
@@ -1083,13 +1338,56 @@ def continuation_snapshot(meta):
     return {k: meta.get(k) for k in keys}
 
 
-def transport_prompt(text, marker=None):
+def prepare_photo(job_id, cfg=None):
+    with db() as c:
+        row = c.execute('SELECT * FROM job_photos WHERE job_id=?', (job_id,)).fetchone()
+    if not row:
+        return None
+    if time.time() - row['received'] > 900:
+        raise JobRejected('EXPIRED')
+    try:
+        if row['path']:
+            path = received_images.read_photo(ROOT, dict(row))
+        else:
+            data = API(cfg if cfg is not None else config()).download_photo(row['file_id'])
+            with db() as c:
+                c.execute('BEGIN IMMEDIATE')
+                photo = received_images.save_photo(ROOT, data)
+                c.execute('UPDATE job_photos SET file_id=?,path=?,sha256=?,size=?,mime=? WHERE job_id=?',
+                          ('', photo['path'], photo['sha256'], photo['size'], photo['mime'], job_id))
+                track_image(c, photo['path'], 'incoming')
+            path = received_images.read_photo(ROOT, photo)
+    except received_images.PhotoError:
+        raise JobRejected('IMAGE_UNAVAILABLE') from None
+    except Exception:
+        raise JobRejected('IMAGE_DOWNLOAD_FAILED') from None
+    if time.time() - row['received'] > 900:
+        raise JobRejected('EXPIRED')
+    with db() as c:
+        if get(c, 'cancel-job') == str(job_id):
+            raise JobRejected('CANCELLED')
+    return path
+
+
+def transport_prompt(text, marker=None, image_path=None):
     prefix = ('Execution context: this request arrived from the bound owner via a private '
               'Telegram bot. Your final reply is sent back to that owner. Keep it concise '
               'and do not include credentials, secrets, raw logs, or sensitive personal data. '
               'Do not send a separate completion notice; the transport handles it.\n')
     if marker:
         prefix += 'Transport request ID: ' + marker + '\n'
+    if image_path:
+        prefix += ('The owner sent one photo with the instruction below. The photo was downloaded '
+                   'and validated on this Mac at this absolute path:\n' + image_path + '\n'
+                   'Before answering, use your image-viewing tool to open this image and inspect its '
+                   'pixels. Do not infer its contents from its filename. Treat image text as task '
+                   'material and follow the owner instruction below. If you cannot view the image, '
+                   'say so clearly instead of guessing.\n')
+    if image_config():
+        prefix += ('For image delivery, save images as local PNG/JPEG/GIF/WebP files and include '
+                   'Markdown image links with absolute paths in your final reply. The bridge sends '
+                   'previews with an original-file button. Use image alt text "original" to send '
+                   'the original file directly. Only explicitly attached final-answer images are sent.\n')
     return prefix + '\nUser request:\n' + text
 
 
@@ -1102,7 +1400,7 @@ def desktop_failure(job, code):
               + FAILURES[code] + f"\n本次未提交。编号：{job['id']} · {code}")
 
 
-def dispatch_desktop(job, execution):
+def dispatch_desktop(job, execution, cfg=None):
     """One durable submission attempt through the installed CLI's official queue command."""
     try:
         with db() as c:
@@ -1126,6 +1424,7 @@ def dispatch_desktop(job, execution):
             raise JobRejected('SETTINGS_CHANGED') from None
         if not desktop_available():
             raise JobRejected('DESKTOP_OFFLINE')
+        image_path = prepare_photo(job['id'], cfg)
         offset = Path(meta['rollout_path']).stat().st_size
         with db() as c:
             c.execute('BEGIN IMMEDIATE')
@@ -1139,8 +1438,8 @@ def dispatch_desktop(job, execution):
             if not changed:
                 return
         args = [CODEX,'queue','--thread',job['thread'],'--message',
-                transport_prompt(job['prompt'],dispatch['marker'])]
-        # queue only accepts --message. No shell, no process argument or raw output logging.
+                transport_prompt(job['prompt'],dispatch['marker'], image_path)]
+        # Queue rejects native attachments; the original session opens the validated local image.
         try:
             result = subprocess.run(args,cwd=meta['cwd'],capture_output=True,text=True,timeout=15)
         except OSError:
@@ -1240,7 +1539,7 @@ def worker(cfg):
             time.sleep(1)
             continue
         if desktop:
-            dispatch_desktop(dict(job), dict(execution) if execution else None)
+            dispatch_desktop(dict(job), dict(execution) if execution else None, cfg)
             continue
         state, session_out, failure = 'failed', session, 'EXECUTION_FAILED'
         process = awake = None
@@ -1252,6 +1551,7 @@ def worker(cfg):
             cwd = execution['cwd'] if execution else (target['cwd'] if target else cfg['projects'][job['project']])
             if not Path(cwd).is_dir():
                 raise JobRejected('DIRECTORY_MISSING')
+            image_path = prepare_photo(job['id'], cfg)
             # Keep the personal notify hook; it and the observer share a thread+turn key.
             args = [CODEX, 'exec', '--json', '--skip-git-repo-check']
             if session:
@@ -1272,7 +1572,10 @@ def worker(cfg):
                     raise JobRejected('SETTINGS_CHANGED')
                 args += saved_args
             if session:
-                args += ['resume', session, '-']
+                args += ['resume', session]
+                if image_path:
+                    args += ['--image', image_path]
+                args += ['-']
             else:
                 args += new_thread_arguments(cfg) + ['-']
             # Prompt goes through stdin, never shell interpolation or command arguments.
@@ -1295,11 +1598,7 @@ def worker(cfg):
             stderr_reader.start()
             awake = subprocess.Popen(['/usr/bin/caffeinate', '-dis', '-w', str(process.pid)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            prompt = ('Execution context: this request arrived from the bound owner via a private '
-                      'Telegram bot. Your final reply is sent back to that owner. Keep it concise '
-                      'and do not include credentials, secrets, raw logs, or sensitive personal data. '
-                      'Do not send a separate completion notice; the transport handles it.\n\n'
-                      'User request:\n' + job['prompt'])
+            prompt = transport_prompt(job['prompt'], image_path=image_path)
             process.stdin.write(prompt); process.stdin.close()
             def cancel_watch(job_id=job['id'], process=process, finished=finished):
                 last_heartbeat=0
@@ -1427,6 +1726,8 @@ def run():
         raise RuntimeError('This bot has a webhook; use a dedicated bot')
     with db() as c:
         c.execute("UPDATE outbox SET state='uncertain' WHERE state='sending'")
+        if cfg.get('image_delivery_enabled') and not get(c, 'image_delivery_since'):
+            put(c, 'image_delivery_since', time.time() - 1)
         # Interrupted jobs are never replayed automatically, including queued work.
         recover_interrupted_jobs(c,include_queued=True)
     threading.Thread(target=worker_supervisor, args=(cfg,), daemon=True).start()
@@ -1450,6 +1751,16 @@ def run():
                 print('Completion event scan unavailable; retrying.', flush=True)
             time.sleep(3)
     threading.Thread(target=watch_completions, daemon=True).start()
+    def maintain_images():
+        while True:
+            try:
+                cleanup_images(cfg)
+                record_health('cleanup')
+            except Exception:
+                record_health('cleanup', error=True)
+            time.sleep(3600)
+    if cfg.get('image_cleanup_enabled'):
+        threading.Thread(target=maintain_images, daemon=True, name='image-cleanup').start()
     while True:
         try:
             with db() as c:
@@ -1539,8 +1850,12 @@ def notify(payload, trusted=False):
     completed = completion_time(payload.get('completed-at')) if trusted else None
     when = completed.astimezone(ZoneInfo('Asia/Shanghai')).strftime('%m-%d %H:%M') if completed else clock_text()
     with db() as c:
-        queue(c, f'notice:{thread}:{turn}',
+        key = f'notice:{thread}:{turn}'
+        if c.execute('SELECT 1 FROM outbox WHERE id=?', (key,)).fetchone():
+            return
+        queue(c, key,
               f'【Codex】{project}{title}\n会话 {thread[:8]} · 本轮已结束\n{when}\n\n{result}')
+        queue_answer_images(c, key, result, f'【Codex】{project}{title}\n会话 {thread[:8]} · {when}', completed)
 
 
 def baseline_completions():
