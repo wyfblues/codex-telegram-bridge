@@ -36,5 +36,6 @@ do not protect files that are already tracked.
 
 Use English and printable ASCII for all Git/GitHub metadata and change-history
 entries, including commit messages, branch names, tags, pull requests, and release
-notes. Branches use `<type>/<short-english-description>` with `feat`, `fix`,
+notes. `main` is the default branch. Base contributions on `main` and use
+`<type>/<short-english-description>` for working branches, with `feat`, `fix`,
 `docs`, `style`, `refactor`, `perf`, `test`, or `chore` as the type.

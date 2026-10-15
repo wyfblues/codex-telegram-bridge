@@ -1,18 +1,39 @@
 # Codex Telegram Bridge
 
-[![Tests](https://github.com/wyfblues/codex-telegram-bridge/actions/workflows/tests.yml/badge.svg?branch=feat%2Finitial-import)](https://github.com/wyfblues/codex-telegram-bridge/actions/workflows/tests.yml)
+[![Tests](https://github.com/wyfblues/codex-telegram-bridge/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/wyfblues/codex-telegram-bridge/actions/workflows/tests.yml)
 ![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-3776AB)
 ![macOS](https://img.shields.io/badge/macOS-local--first-161B22)
 [![MIT License](https://img.shields.io/badge/License-MIT-7AC9B0)](LICENSE)
 
-**Send a task from your phone. Continue the original Codex session on your Mac.**
+**Leave your desk. Keep your Codex conversation going.**
 
 English · [简体中文](README.zh-CN.md)
 
-A small Python bridge between a paired Telegram private chat and local Codex
-sessions. Choose a project, continue a conversation, follow its public progress,
-and receive the full final answer. Routing, polling, and delivery use ordinary
-Python, with no extra model acting as a dispatcher.
+Codex is still checking code or running tests, but you need to head out. Later,
+you want to read the result, ask a follow-up, or send a screenshot of something
+you noticed. Codex Telegram Bridge connects your phone's Telegram chat to Codex
+on your Mac, so you can keep working without returning to your desk.
+
+Choose a project and an existing conversation, then send your task. It continues
+in the original Codex session with its context and execution settings. When the
+answer arrives, reply to that message to continue the same conversation, even
+if you have since selected a different project. There is no need to explain the
+background again or keep track of which chat a result belongs to.
+
+You can follow the work without filling your chat with updates. An optional
+progress card edits the same message with status, elapsed time, and the latest
+public progress. The full final answer arrives separately; long answers are
+split without truncation. Send one photo with a caption to an existing session,
+receive previews of local images attached to Codex's final answer, and request
+the original files when you need the detail. Optional cleanup manages those
+image copies without touching project originals.
+
+The bridge runs on your own Mac using the Python standard library. Your projects
+and task execution stay there, and only the paired private Telegram account can
+submit work. Ordinary code handles polling, routing, notifications, progress,
+and image management, without an extra model dispatching requests. Keep your Mac
+awake, online, and Codex available, and your phone becomes another way to pick up
+the work you already started.
 
 ![Telegram to local Codex workflow](docs/images/overview.png)
 
@@ -25,10 +46,6 @@ Python, with no extra model acting as a dispatcher.
 
 *The visuals use fictional projects, conversations, messages, and images. They
 are an illustrative demo, not a recording of a private conversation.*
-
-This is an independent, personal-use project for macOS. The bot's messages and
-menus are currently mostly in Chinese. It relies on local Codex interfaces that
-can change; it is not an official OpenAI or Telegram integration.
 
 ## How it works
 
