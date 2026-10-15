@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 import image_delivery as images
 import image_receive as received_images
 import image_retention as retention
+import progress_card as progress
 
 ROOT = Path(__file__).resolve().parent
 CODEX = os.environ.get('CODEX_CLI', '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex')
@@ -95,6 +96,13 @@ def db():
         path TEXT, sha256 TEXT, size INTEGER, mime TEXT, received REAL NOT NULL);
       CREATE TABLE IF NOT EXISTS image_retention(path TEXT PRIMARY KEY, kind TEXT NOT NULL,
         last_used REAL NOT NULL, expired_at REAL);
+      CREATE TABLE IF NOT EXISTS progress_cards(id TEXT PRIMARY KEY, job_id INTEGER UNIQUE,
+        thread TEXT, turn TEXT, project TEXT NOT NULL, title TEXT NOT NULL,
+        started REAL NOT NULL, finished REAL, state TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '',
+        event_at REAL NOT NULL DEFAULT 0, version INTEGER NOT NULL DEFAULT 0,
+        last_version INTEGER NOT NULL DEFAULT -1, last_text TEXT NOT NULL DEFAULT '',
+        last_sent REAL NOT NULL DEFAULT 0, next_try REAL NOT NULL DEFAULT 0,
+        disabled INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS reply_jobs(job_id INTEGER PRIMARY KEY, thread TEXT, cwd TEXT);
       CREATE TABLE IF NOT EXISTS keyboards(id TEXT PRIMARY KEY, markup TEXT);
       CREATE TABLE IF NOT EXISTS choices(token TEXT PRIMARY KEY, project TEXT, thread TEXT,
@@ -126,6 +134,251 @@ def get(c, key, default=''):
 
 def put(c, key, value):
     c.execute('INSERT OR REPLACE INTO kv VALUES (?,?)', (key, str(value)))
+
+
+def progress_safe(c, function, *args, **kwargs):
+    """A card failure cannot roll back a task, receipt, or final answer."""
+    c.execute('SAVEPOINT progress_feature')
+    try:
+        result = function(c, *args, **kwargs)
+    except Exception:
+        c.execute('ROLLBACK TO progress_feature')
+        result = None
+    c.execute('RELEASE progress_feature')
+    return result
+
+
+def progress_secrets():
+    try:
+        token = (ROOT / 'token').read_text().strip()
+        return (token,) if token else ()
+    except OSError:
+        return ()
+
+
+def progress_set(c, card_id, *, now=None, **changes):
+    row = c.execute('SELECT * FROM progress_cards WHERE id=?', (card_id,)).fetchone()
+    if not row or row['finished'] is not None:
+        return False
+    now = time.time() if now is None else now
+    allowed = {'thread','turn','title','state','detail','event_at','finished'}
+    changes = {key:value for key,value in changes.items() if key in allowed and row[key] != value}
+    for key in ('title','detail'):
+        if key in changes:
+            changes[key] = progress.clean(changes[key], secrets=progress_secrets())
+    state = changes.get('state', row['state'])
+    if state in progress.TERMINAL_STATES:
+        changes.setdefault('finished', now)
+    if not changes:
+        return False
+    fields = ','.join(key+'=?' for key in changes)
+    c.execute('UPDATE progress_cards SET '+fields+',version=version+1 WHERE id=?',
+              (*changes.values(),card_id))
+    updated = c.execute('SELECT * FROM progress_cards WHERE id=?', (card_id,)).fetchone()
+    # An unsent acknowledgement can already reflect a very fast task's final state.
+    c.execute("UPDATE outbox SET text=? WHERE id=? AND state='pending'",
+              (progress.render(dict(updated), now=now),card_id))
+    return True
+
+
+def progress_update_job(c, job_id, **changes):
+    row = c.execute('SELECT id FROM progress_cards WHERE job_id=?', (job_id,)).fetchone()
+    return progress_set(c, row['id'], **changes) if row else False
+
+
+def progress_begin_job(c, cfg, job_id):
+    if not cfg.get('progress_cards_enabled'):
+        return None
+    job = c.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+    if not job or job['state'] != 'queued':
+        return None
+    key = 'reply:' + str(job_id)
+    meta = thread_metadata(job['thread']) if job['thread'] else None
+    title = display_title(meta) if meta else '新会话任务'
+    c.execute('''INSERT OR IGNORE INTO progress_cards
+        (id,job_id,thread,project,title,started,state) VALUES (?,?,?,?,?,?,?)''',
+              (key,job_id,job['thread'] or None,progress.clean(job['project'],secrets=progress_secrets()),
+               progress.clean(title,secrets=progress_secrets()),time.time(),'queued'))
+    row = c.execute('SELECT * FROM progress_cards WHERE id=?', (key,)).fetchone()
+    queue(c,key,progress.render(dict(row)))
+    return key
+
+
+def queue_task_reply(c, cfg, job_id, text):
+    if not progress_safe(c, progress_begin_job, cfg, job_id):
+        queue(c,'reply:'+str(job_id),text)
+
+
+def progress_worker_update(cfg, job_id, event=None, **changes):
+    """Isolate the entire optional connection from the executing subprocess."""
+    if not cfg.get('progress_cards_enabled'):
+        return
+    try:
+        if event is not None:
+            detail = progress.event_detail(event,secrets=progress_secrets())
+            if not detail:
+                return
+            changes.update(detail=detail,state='running')
+        with db() as c:
+            progress_safe(c,progress_update_job,job_id,**changes)
+    except Exception:
+        pass  # Progress storage cannot interrupt or terminate a real task.
+
+
+def progress_event(c, cfg, thread, event):
+    """Only current primary turns and explicitly public commentary enter cards."""
+    if not cfg.get('progress_cards_enabled'):
+        return
+    stamp = completion_time(event.get('timestamp'))
+    if stamp is None:
+        return
+    stamp = stamp.timestamp()
+    payload = event.get('payload',{})
+    if not isinstance(payload,dict):
+        return
+    kind = payload.get('type') if event.get('type') == 'event_msg' else None
+    detail = progress.event_detail(event,secrets=progress_secrets())
+    if kind not in ('task_started','task_complete','turn_aborted') and not detail:
+        return
+    passthrough = payload.get('internal_chat_message_metadata_passthrough') or {}
+    turn = payload.get('turn_id') or (passthrough.get('turn_id') if isinstance(passthrough,dict) else None)
+    if not isinstance(turn,str) or not turn:
+        return
+    row = c.execute('SELECT * FROM progress_cards WHERE thread=? AND turn=?', (thread,turn)).fetchone()
+    if not row:
+        pending = c.execute('''SELECT p.*,d.turn_id AS matched_turn,d.job_id AS desktop_job
+            FROM progress_cards p JOIN jobs j ON j.id=p.job_id
+            LEFT JOIN desktop_dispatch d ON d.job_id=j.id
+            WHERE j.thread=? AND j.state IN ('queued','running') AND p.turn IS NULL
+                AND p.finished IS NULL ORDER BY p.started DESC LIMIT 1''', (thread,)).fetchone()
+        if pending and stamp >= pending['started'] - 1:
+            if pending['desktop_job'] is not None and pending['matched_turn'] != turn:
+                return  # Only the exact Desktop request marker may associate this card.
+            if pending['desktop_job'] is None and not (
+                    kind == 'task_started' and pending['event_at'] >= pending['started']
+                    and stamp >= pending['event_at']):
+                return  # A prior turn's completion/commentary cannot claim a new CLI job.
+            progress_set(c,pending['id'],thread=thread,turn=turn,state='running')
+            row = c.execute('SELECT * FROM progress_cards WHERE id=?', (pending['id'],)).fetchone()
+        elif kind == 'task_started':
+            since = float(get(c,'progress_since',str(time.time()-1)))
+            if stamp < since or c.execute('SELECT 1 FROM outbox WHERE id=?',
+                                         (f'notice:{thread}:{turn}',)).fetchone():
+                return
+            # A new CLI session may have started before its thread ID reached the worker.
+            if c.execute("SELECT 1 FROM jobs WHERE state IN ('queued','running') AND (thread IS NULL OR thread='')").fetchone():
+                return
+            if c.execute("SELECT 1 FROM jobs WHERE thread=? AND state IN ('queued','running')", (thread,)).fetchone():
+                return
+            meta = thread_metadata(thread)
+            if not meta or meta.get('archived') or meta['source'] not in ('vscode','cli','exec'):
+                return
+            project = next((name for name,cwd in cfg.get('projects',{}).items() if cwd==meta['cwd']),Path(meta['cwd']).name)
+            key = f'progress:{thread}:{turn}'
+            c.execute('''INSERT OR IGNORE INTO progress_cards
+                (id,thread,turn,project,title,started,state,event_at) VALUES (?,?,?,?,?,?,?,?)''',
+                      (key,thread,turn,progress.clean(project,secrets=progress_secrets()),
+                       progress.clean(display_title(meta),secrets=progress_secrets()),stamp,'running',stamp))
+            row = c.execute('SELECT * FROM progress_cards WHERE id=?', (key,)).fetchone()
+            queue(c,key,progress.render(dict(row)))
+    if not row or row['finished'] is not None or stamp < max(row['started']-1,row['event_at']):
+        return
+    if kind in ('task_complete','turn_aborted'):
+        progress_set(c,row['id'],state='ended' if kind=='task_complete' else 'cancelled',
+                     finished=max(stamp,row['started']),event_at=stamp)
+    else:
+        if detail:
+            progress_set(c,row['id'],state='running',detail=detail,event_at=stamp)
+
+
+def refresh_progress_cards(cfg):
+    if not cfg.get('progress_cards_enabled'):
+        return
+    with db() as c:
+        rows = c.execute('''SELECT p.*,j.state AS job_state,d.phase AS dispatch_phase
+            FROM progress_cards p JOIN jobs j ON j.id=p.job_id
+            LEFT JOIN desktop_dispatch d ON d.job_id=j.id WHERE p.finished IS NULL''').fetchall()
+        for row in rows:
+            state = {'turn-ended':'ended','failed':'failed','cancelled':'cancelled',
+                     'interrupted':'interrupted'}.get(row['job_state'])
+            if state:
+                progress_safe(c,progress_set,row['id'],state=state)
+        now = time.time()
+        if now - float(get(c,'progress_probe','0')) < 30:
+            return
+        put(c,'progress_probe',now)
+        generic = [dict(r) for r in c.execute('''SELECT * FROM progress_cards
+            WHERE job_id IS NULL AND finished IS NULL AND started<?''',(now-30,))]
+    if not generic:
+        return
+    try:
+        paths = open_rollout_paths()
+    except (OSError,subprocess.SubprocessError):
+        return  # Unavailable process metadata does not prove an interruption.
+    for row in generic:
+        meta = thread_metadata(row['thread'])
+        event = find_task_event(meta,('task_started','task_complete','turn_aborted')) if meta else None
+        if not event:
+            continue
+        with db() as c:
+            if event['payload'].get('turn_id') != row['turn']:
+                stamp = completion_time(event.get('timestamp'))
+                if stamp and stamp.timestamp() > max(row['started'],row['event_at']):
+                    progress_safe(c,progress_set,row['id'],state='interrupted',
+                                  detail='同会话已进入后续回合，未确认本回合最终结果；停止刷新且不自动重跑。')
+                continue
+            if event['payload']['type'] in ('task_complete','turn_aborted'):
+                progress_safe(c,progress_event,cfg,row['thread'],event)
+            elif meta['rollout_path'] not in paths and thread_writer_busy(row['thread']) is False:
+                progress_safe(c,progress_set,row['id'],state='interrupted',
+                              detail='本回合执行进程已退出，未确认最终结果；不会自动重跑。')
+
+
+def deliver_progress(api, cfg, now=None):
+    """Coalesce updates into one known message; never send a replacement card."""
+    if not cfg.get('progress_cards_enabled'):
+        return False
+    now = time.time() if now is None else now
+    with db() as c:
+        rows = c.execute('''SELECT p.*,o.receipt FROM progress_cards p JOIN outbox o ON o.id=p.id
+            WHERE p.disabled=0 AND o.state='sent' AND o.receipt IS NOT NULL
+                AND (p.finished IS NULL OR p.version>p.last_version)
+                AND p.next_try<=? AND p.last_sent<=? ORDER BY p.last_sent,p.started''',
+                         (now,now-progress.CARD_INTERVAL)).fetchall()
+        selected = None
+        for row in rows:
+            text = progress.render(dict(row),now=now)
+            if text != row['last_text']:
+                selected = row
+                break
+            if row['version'] > row['last_version']:
+                c.execute('UPDATE progress_cards SET last_version=? WHERE id=?',
+                          (row['version'],row['id']))
+        if selected is None:
+            return False
+        card_id, version = selected['id'],selected['version']
+    disabled, retry = False, now + progress.CARD_INTERVAL
+    acknowledged = False
+    try:
+        api.call('editMessageText',chat_id=cfg['chat_id'],message_id=selected['receipt'],text=text)
+        acknowledged = True
+    except Rejected as error:
+        if error.not_modified:
+            acknowledged = True
+        elif error.code == 429:
+            retry = now + max(error.retry,progress.CARD_INTERVAL)
+        else:
+            disabled = True
+    except Exception:
+        pass  # Retrying an edit addresses the same message, never creates a duplicate.
+    with db() as c:
+        if acknowledged:
+            c.execute('''UPDATE progress_cards SET last_text=?,last_version=?,last_sent=?,next_try=0
+                WHERE id=?''',(text,version,now,card_id))
+        else:
+            c.execute('UPDATE progress_cards SET disabled=?,next_try=? WHERE id=?',
+                      (int(disabled),retry,card_id))
+    return True
 
 
 def message_parts(text, limit=3400):
@@ -680,6 +933,7 @@ def health_text(c,cfg):
              '图片发送：'+('已启用' if cfg.get('image_delivery_enabled') else '已停用'),
              '图片接收：'+('已启用（单张图片＋说明）' if cfg.get('image_receive_enabled') else '已停用'),
              '图片清理：'+('已启用（接收 7 天／原图 30 天，每小时检查）' if cfg.get('image_cleanup_enabled') else '已停用'),
+             '执行进度卡片：'+('已启用（同一条消息，每 10 秒最多更新一次）' if cfg.get('progress_cards_enabled') else '已停用'),
              '上次成功接收检查：'+age('health:poll'),
              '上次成功扫描任务：'+age('health:observer'),
              '上次发送检查：'+age('health:sender'),
@@ -715,7 +969,9 @@ def cancel_job(c, job_id=None):
     put(c,'cancel-job',job['id'])
     if job['state'] == 'queued':
         c.execute("UPDATE jobs SET state='cancelled',prompt='' WHERE id=?",(job['id'],))
+        progress_safe(c,progress_update_job,job['id'],state='cancelled')
         return f"已取消尚未启动的任务：{job['project']}。"
+    progress_safe(c,progress_update_job,job['id'],state='waiting',detail='已请求停止，等待执行进程确认。')
     return f"已请求停止任务：{job['project']}。停止后会收到结果通知。"
 
 
@@ -974,7 +1230,7 @@ def resolve_reply(c, cfg, message):
         return None
     key = row['id'].split(':')
     thread = None
-    if len(key) >= 3 and key[0] in ('notice', 'result-backfill', 'last'):
+    if len(key) >= 3 and key[0] in ('notice', 'result-backfill', 'last', 'progress'):
         thread = key[1]
     elif len(key) >= 2 and key[0] in ('job', 'reply'):
         try:
@@ -1047,7 +1303,7 @@ def accept(cfg, update):
         if 'photo' in m or 'media_group_id' in m:
             reply = ('这条消息已超过 15 分钟，未自动执行。请重新发送。'
                      if time.time() - m.get('date', 0) > 900 else accept_photo(c, cfg, uid, m))
-            queue(c, 'reply:' + str(uid), reply)
+            queue_task_reply(c,cfg,uid,reply)
             return
         text = m.get('text', '').strip()
         if text.startswith('/'):
@@ -1131,7 +1387,7 @@ def accept(cfg, update):
             c.execute('INSERT INTO jobs VALUES (?,?,?,?,?)', (uid, key, text, 'queued', ''))
             c.execute('INSERT INTO execution_targets VALUES (?,?,?)',(uid,cfg['projects'][key],None))
             reply = f'已接收任务 {uid}，项目：{key}。'
-        queue(c, 'reply:' + str(uid), reply)
+        queue_task_reply(c,cfg,uid,reply)
 
 
 def deliver(api, cfg):
@@ -1145,6 +1401,7 @@ def deliver(api, cfg):
         keyboard = c.execute('SELECT markup FROM keyboards WHERE id=?', (row['id'],)).fetchone()
         edit=c.execute('SELECT target FROM message_edits WHERE id=?',(row['id'],)).fetchone()
         media = c.execute('SELECT * FROM outbox_media WHERE id=?', (row['id'],)).fetchone()
+        card = c.execute('SELECT version FROM progress_cards WHERE id=?', (row['id'],)).fetchone()
     state, receipt, retry = 'uncertain', None, 0
     try:
         extra = {'reply_markup': json.loads(keyboard['markup'])} if keyboard else {}
@@ -1182,6 +1439,9 @@ def deliver(api, cfg):
     with db() as c:
         c.execute('UPDATE outbox SET state=?,receipt=?,next_try=? WHERE id=?',
                   (state, receipt, retry, row['id']))
+        if card and state == 'sent':
+            c.execute('UPDATE progress_cards SET last_text=?,last_version=?,last_sent=? WHERE id=?',
+                      (row['text'],card['version'],time.time(),row['id']))
         if media and state == 'sent':
             try:
                 track_image(c, media['path'], 'media')
@@ -1251,6 +1511,7 @@ def recover_interrupted_jobs(c, include_queued=False):
             c.execute("UPDATE jobs SET prompt='' WHERE id=?",(row['id'],))
             continue
         c.execute("UPDATE jobs SET state='interrupted',prompt='' WHERE id=?",(row['id'],))
+        progress_safe(c,progress_update_job,row['id'],state='interrupted',detail='执行服务恢复，任务状态待确认；不会自动重跑。')
         identity=f" · {row['thread'][:8]}" if row['thread'] else ''
         queue(c,'interrupted:'+str(row['id']),
               f"【任务状态待确认】{row['project']}{identity}\n执行服务恢复，不会自动重跑这条任务。"
@@ -1396,6 +1657,7 @@ def desktop_failure(job, code):
         c.execute("UPDATE jobs SET state='failed',prompt='' WHERE id=?",(job['id'],))
         c.execute("UPDATE desktop_dispatch SET phase='rejected' WHERE job_id=?",(job['id'],))
         c.execute('INSERT OR REPLACE INTO job_diagnostics VALUES (?,?,?)',(job['id'],code,time.time()))
+        progress_safe(c,progress_update_job,job['id'],state='failed',detail=FAILURES[code])
         queue(c,'job:'+str(job['id']),f"【Codex】{job['project']} · {job['thread'][:8]}\n"
               + FAILURES[code] + f"\n本次未提交。编号：{job['id']} · {code}")
 
@@ -1437,6 +1699,7 @@ def dispatch_desktop(job, execution, cfg=None):
                 (meta['rollout_path'],offset,time.time(),job['id'])).rowcount
             if not changed:
                 return
+            progress_safe(c,progress_update_job,job['id'],state='submitting')
         args = [CODEX,'queue','--thread',job['thread'],'--message',
                 transport_prompt(job['prompt'],dispatch['marker'], image_path)]
         # Queue rejects native attachments; the original session opens the validated local image.
@@ -1459,6 +1722,10 @@ def dispatch_desktop(job, execution, cfg=None):
             c.execute('INSERT OR REPLACE INTO process_diagnostics VALUES (?,?,?,?,?)',
                       (job['id'],result.returncode if result else None,'desktop-queue',
                        'queue accepted' if confirmed else 'queue outcome uncertain',time.time()))
+            current = c.execute('SELECT turn_id FROM desktop_dispatch WHERE job_id=?',(job['id'],)).fetchone()
+            if current and not current['turn_id']:
+                progress_safe(c,progress_update_job,job['id'],state='accepted' if confirmed else 'uncertain',
+                              detail='等待桌面原回合启动。' if confirmed else '提交结果待确认，不会自动重复提交。')
     except JobRejected as error:
         desktop_failure(job,error.code)
     except OSError:
@@ -1506,20 +1773,27 @@ def reconcile_desktop_jobs():
         with db() as c:
             c.execute('UPDATE desktop_dispatch SET turn_id=?,phase=?,offset=? WHERE job_id=?',
                       (turn,phase,offset,row['job_id']))
+            if turn:
+                progress_safe(c,progress_update_job,row['job_id'],thread=row['thread'],turn=turn,state='running')
             if completion:
                 state = 'turn-ended' if completion == 'task_complete' else 'cancelled'
                 c.execute("UPDATE jobs SET state=?,prompt='' WHERE id=?",(state,row['job_id']))
                 c.execute('UPDATE desktop_dispatch SET phase=? WHERE job_id=?',(state,row['job_id']))
                 c.execute('INSERT OR REPLACE INTO job_diagnostics VALUES (?,?,?)',
                           (row['job_id'],state,time.time()))
+                progress_safe(c,progress_update_job,row['job_id'],state='ended' if state=='turn-ended' else 'cancelled')
                 if state == 'cancelled':
                     queue(c,'job:'+str(row['job_id']),f"【Codex】{row['project']} · {row['thread'][:8]}\n桌面回合已停止。")
             elif not turn and not row['warned'] and time.time() - (row['submitted'] or row['created']) > 60:
                 c.execute('UPDATE desktop_dispatch SET warned=1 WHERE job_id=?',(row['job_id'],))
-                queue(c,'desktop-wait:'+str(row['job_id']),
-                      f"【桌面任务待确认】{row['project']} · {row['thread'][:8]}\n"
-                      '尚未确认桌面开始执行。不会重复提交；请在 Codex 打开原会话检查队列，'
-                      '或用 /status 查看。Bot 不能撤回已提交的桌面消息。')
+                if c.execute('SELECT 1 FROM progress_cards WHERE job_id=?',(row['job_id'],)).fetchone():
+                    progress_safe(c,progress_update_job,row['job_id'],state='uncertain',
+                                  detail='尚未确认桌面开始执行；不会重复提交，请在原会话检查队列。')
+                else:
+                    queue(c,'desktop-wait:'+str(row['job_id']),
+                          f"【桌面任务待确认】{row['project']} · {row['thread'][:8]}\n"
+                          '尚未确认桌面开始执行。不会重复提交；请在 Codex 打开原会话检查队列，'
+                          '或用 /status 查看。Bot 不能撤回已提交的桌面消息。')
 
 
 def worker(cfg):
@@ -1531,6 +1805,7 @@ def worker(cfg):
             job = c.execute("SELECT * FROM jobs WHERE state='queued' ORDER BY id LIMIT 1").fetchone()
             if job:
                 c.execute("UPDATE jobs SET state='running' WHERE id=?", (job['id'],))
+                progress_safe(c,progress_update_job,job['id'],state='submitting')
                 target = c.execute('SELECT * FROM reply_jobs WHERE job_id=?', (job['id'],)).fetchone()
                 execution=c.execute('SELECT * FROM execution_targets WHERE job_id=?',(job['id'],)).fetchone()
                 session = job['thread'] or ''
@@ -1580,6 +1855,7 @@ def worker(cfg):
                 args += new_thread_arguments(cfg) + ['-']
             # Prompt goes through stdin, never shell interpolation or command arguments.
             stage = 'launch'
+            progress_worker_update(cfg,job['id'],state='running',event_at=time.time())
             process = subprocess.Popen(args, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, start_new_session=True)
             ACTIVE_PROCESS = process
@@ -1635,6 +1911,10 @@ def worker(cfg):
                         raise JobRejected('TARGET_UNAVAILABLE')
                     with db() as c:
                         c.execute('UPDATE jobs SET thread=? WHERE id=?', (session_out, job['id']))
+                        meta = thread_metadata(session_out)
+                        progress_safe(c,progress_update_job,job['id'],thread=session_out,
+                                      title=display_title(meta) if meta else '新会话任务')
+                progress_worker_update(cfg,job['id'],event=event)
                 if event.get('type') == 'turn.completed':
                     stage = 'turn-completed'
                     completed = True
@@ -1679,6 +1959,8 @@ def worker(cfg):
                 put(c, 'thread:' + job['project'], session_out)
             c.execute('INSERT OR REPLACE INTO job_diagnostics VALUES (?,?,?)',
                       (job['id'],failure if state=='failed' else state,time.time()))
+            progress_safe(c,progress_update_job,job['id'],state='ended' if state=='turn-ended' else state,
+                          detail=FAILURES[failure] if state=='failed' else '')
             label = {'turn-ended': '本轮已结束', 'failed': '执行未完成：'+FAILURES[failure],
                      'cancelled': '已停止'}[state]
             identity = '连接自检' if job['id'] < 0 else '任务 ' + str(job['id'])
@@ -1728,13 +2010,16 @@ def run():
         c.execute("UPDATE outbox SET state='uncertain' WHERE state='sending'")
         if cfg.get('image_delivery_enabled') and not get(c, 'image_delivery_since'):
             put(c, 'image_delivery_since', time.time() - 1)
+        if cfg.get('progress_cards_enabled'):
+            put(c,'progress_since',time.time()-1)  # Never create cards for pre-start history.
         # Interrupted jobs are never replayed automatically, including queued work.
         recover_interrupted_jobs(c,include_queued=True)
     threading.Thread(target=worker_supervisor, args=(cfg,), daemon=True).start()
     def sender():
         while True:
             try:
-                deliver(api, cfg)
+                if not deliver(api, cfg):
+                    deliver_progress(api,cfg)
                 record_health('sender')
             except Exception:
                 record_health('sender',error=True)
@@ -1743,8 +2028,9 @@ def run():
     def watch_completions():
         while True:
             try:
-                scan_completions()
                 reconcile_desktop_jobs()
+                scan_completions()
+                refresh_progress_cards(cfg)
                 record_health('observer')
             except Exception:
                 record_health('observer',error=True)
@@ -1851,6 +2137,9 @@ def notify(payload, trusted=False):
     when = completed.astimezone(ZoneInfo('Asia/Shanghai')).strftime('%m-%d %H:%M') if completed else clock_text()
     with db() as c:
         key = f'notice:{thread}:{turn}'
+        card = c.execute('SELECT id FROM progress_cards WHERE thread=? AND turn=?',(thread,turn)).fetchone()
+        if card:
+            progress_safe(c,progress_set,card['id'],state='ended')
         if c.execute('SELECT 1 FROM outbox WHERE id=?', (key,)).fetchone():
             return
         queue(c, key,
@@ -1877,6 +2166,10 @@ def baseline_completions():
 
 def scan_completions():
     baseline_completions()
+    try:
+        cfg = config()
+    except (OSError,ValueError):
+        cfg = {}
     with db() as c:
         since = int(get(c, 'monitor_since', '0'))
     with closing(sqlite3.connect(f'file:{THREAD_DB}?mode=ro', uri=True, timeout=2)) as src:
@@ -1917,6 +2210,12 @@ def scan_completions():
                     except ValueError:
                         continue
                     payload = event.get('payload', {})
+                    if (cfg.get('progress_cards_enabled') and isinstance(payload,dict) and
+                            ((event.get('type')=='event_msg' and (payload.get('type') in ('task_started','task_complete','turn_aborted')
+                             or (payload.get('type')=='agent_message' and payload.get('phase')=='commentary')))
+                             or (event.get('type')=='response_item' and payload.get('role')=='assistant' and payload.get('phase')=='commentary'))):
+                        with db() as c:
+                            progress_safe(c,progress_event,cfg,thread,event)
                     if event.get('type') == 'event_msg' and payload.get('type') == 'task_complete':
                         completed = completion_time(event.get('timestamp'))
                         # updated_at also changes when viewing or archiving a conversation.

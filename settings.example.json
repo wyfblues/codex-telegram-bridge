@@ -4,6 +4,7 @@
     "demo": "/absolute/path/to/your/project"
   },
   "execution_enabled": false,
+  "progress_cards_enabled": false,
   "image_delivery_enabled": false,
   "image_receive_enabled": false,
   "image_cleanup_enabled": false,
