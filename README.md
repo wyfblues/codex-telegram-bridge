@@ -44,9 +44,6 @@ workflow a Telegram entry point, with a few deliberate choices:
 
 </details>
 
-*The visuals use fictional projects, conversations, messages, and images. They
-are an illustrative demo, not a recording of a private conversation.*
-
 ## How does it compare with official Codex on mobile?
 
 The official app already supports local conversations, progress, notifications,

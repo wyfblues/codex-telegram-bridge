@@ -30,8 +30,6 @@ Codex Telegram Bridge 是一个运行在 Mac 上的开源 Telegram 机器人。
 
 ![Telegram 项目选择、进度卡片与答复演示](docs/images/demo.gif)
 
-*图中项目、会话、消息及图片均为虚构演示数据，不包含真实聊天记录。*
-
 ## 和官方手机端 Codex 有什么区别？
 
 官方手机端已经支持本机会话、进度、通知和附件，还能审批命令、查看代码差异，
