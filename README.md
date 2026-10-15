@@ -128,47 +128,80 @@ does not prove that a person read the message.
 
 ## Quick start
 
-Allow about five minutes once the prerequisites are ready. Setup is manual and
-does not install or replace a background service.
+You need macOS, Python 3.9+, and a signed-in local Codex installation. No `pip`
+packages, Telegram `api_id`/`api_hash`, public server, or inbound port are needed.
+This guide runs the bridge in a terminal; it does not install a background service.
 
-You need macOS, Python 3.9+, a signed-in local Codex installation, and a dedicated
-bot created with [BotFather](https://t.me/BotFather). Do not share that bot with
-another poller or webhook. Desktop continuation also requires a running Desktop
-app and a CLI that supports `queue --thread`.
-
-**Check the installation paths first.** The current CLI default is
-`/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex`. Desktop process
-detection is hard-coded to `/Applications/ChatGPT.app/Contents/MacOS/ChatGPT`.
-Setting `CODEX_CLI` changes the CLI path but does not change that detection; an
-installation named `Codex.app` is not automatically compatible with this check.
-
-For a different CLI or local database path, set these **before** setup and run:
-
-```sh
-export CODEX_CLI="/absolute/path/to/codex"
-export CODEX_THREAD_DB="$HOME/.codex/state_5.sqlite"
-```
-
-`CODEX_HOME` can change the default Codex data directory. Set these variables in
-the LaunchAgent environment too if you use one. The bridge currently displays
-times in `Asia/Shanghai`.
-
-1. Clone into a private local directory and pair the bot:
+1. **Download the source and enter its directory.** With Git installed:
 
    ```sh
    git clone https://github.com/wyfblues/codex-telegram-bridge.git
    cd codex-telegram-bridge
    chmod 700 .
+   ```
+
+   Alternatively, download GitHub's ZIP, extract it, and open a terminal in the
+   extracted directory, then run `chmod 700 .`. Run all following commands there,
+   using the same Python.
+
+2. **Check Python and Codex before pairing.** Open Desktop, sign in, and create
+   a conversation in the project directory you want to use. Send a simple text
+   request and wait for its answer; an empty new chat may not have a resumable
+   record yet. Check the default CLI:
+
+   ```sh
+   python3 --version
+   export CODEX_CLI="/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
+   "$CODEX_CLI" --version
+   "$CODEX_CLI" queue --help
+   ```
+
+   Python must be 3.9 or newer. The CLI must run, and its `queue` help must include
+   `--thread`. If not, resolve the installation or CLI compatibility first.
+
+   **Desktop compatibility:** the running-app check currently recognizes only
+   `/Applications/ChatGPT.app/Contents/MacOS/ChatGPT`. Changing `CODEX_CLI` does
+   not change that check; an installation named `Codex.app` is not automatically
+   compatible. Do not rename the app to work around it.
+
+   Conversation discovery also needs the existing Codex database, normally
+   `$HOME/.codex/state_5.sqlite`. For a different location, set
+   `CODEX_THREAD_DB` to its absolute path before running the bridge. `CODEX_HOME`
+   changes the default Codex data directory. Do not create an empty database or
+   copy someone else's. A custom CLI path, if needed, replaces the value above.
+   Environment variables must also be set in any future LaunchAgent.
+
+3. **Create your own bot and pair your account.** In Telegram, open the official
+   [BotFather](https://t.me/BotFather), send `/newbot`, and follow its prompts for
+   a display name and a username ending in `bot`. It returns your Bot Token.
+   See [Telegram's bot creation guide](https://core.telegram.org/bots/features#creating-a-new-bot).
+   Use a dedicated bot with no existing webhook or other polling program.
+
+   ```sh
    python3 bridge.py setup
    ```
 
-   Enter the token in the terminal's hidden prompt. Send the displayed
-   `/start <challenge>` to your bot from your private Telegram account within
-   10 minutes. Setup creates local `token` and `settings.json` files with `0600`
-   permissions; remote execution starts disabled.
+   Paste the token at `Paste BotFather token (hidden):`; characters will not be
+   shown. Do not put it in a command, README, issue, or Telegram message.
+   The next prompt asks for an HTTPS proxy URL:
 
-2. Edit the generated `settings.json`, preserving its pairing fields. Set
-   `projects` to your own absolute directories and enable execution when ready:
+   - If the Mac can reach Telegram directly, press Enter to leave it blank.
+   - Otherwise, enter your HTTP proxy endpoint, such as
+     `http://127.0.0.1:7890`, with your actual port. SOCKS URLs are not supported.
+
+   A blank value uses a direct connection; this bridge does not inherit system
+   proxy settings or `HTTPS_PROXY`. The `setup` command asks interactively, so do
+   not use `setup --proxy` to supply this value.
+
+   Keep the terminal open. Open the bot link it prints and send the **complete**
+   `/start <challenge>` line from your own private Telegram account within the
+   pairing window of about 10 minutes. Pressing Start alone is insufficient.
+   Successful pairing prints `Paired.` and creates local `token`,
+   `settings.json` (both `0600`), and `state.sqlite3`. Execution starts disabled.
+   You do not need to find or enter chat, user, or bot IDs yourself.
+
+4. **Configure a project.** Open the generated `settings.json` in a plain-text
+   editor. Modify these fields inside it, preserving the other fields:
 
    ```json
    {
@@ -179,27 +212,73 @@ times in `Asia/Shanghai`.
    }
    ```
 
-   This is a fragment, not a replacement configuration. Use
-   [settings.example.json](settings.example.json) for the full structure, and
-   never overwrite the paired file with the example. Optional features are
-   disabled by default: `progress_cards_enabled`, `image_delivery_enabled`,
-   `image_receive_enabled`, and `image_cleanup_enabled`.
+   Replace the example path with an existing absolute project directory, exactly
+   matching the directory used by its Codex conversation. Do not use `~`, a
+   different worktree, or a symlink alias. `demo` is your menu label and can change.
+   `execution_enabled: true` permits your paired account to submit Codex tasks.
+   This is a **fragment**, not a replacement configuration: keep `proxy`,
+   `chat_id`, `user_id`, `bot_id`, and `bot_username` generated by setup.
+   Never copy [settings.example.json](settings.example.json) over the paired file.
 
-3. Register the menu and run the service:
+   Progress, image sending, image receiving, and cleanup are optional and default
+   to off. Add `progress_cards_enabled`, `image_delivery_enabled`,
+   `image_receive_enabled`, and `image_cleanup_enabled` with value `true` to
+   enable them. Check JSON syntax without printing its private contents:
+
+   ```sh
+   python3 -m json.tool settings.json >/dev/null
+   ```
+
+5. **Register the menu, start, and verify.** Register once; successful output
+   includes `"verified": true`. Then start the foreground service:
 
    ```sh
    python3 configure_menu.py
    python3 bridge.py run
    ```
 
-   In Telegram, send `/projects`, choose a project and conversation, then send a
-   task. Use `/health` to check the connection. Keep this terminal running, or
+   Keep this terminal open and the Mac awake and online. The service may be quiet
+   while idle. In your paired private chat:
+
+   - Send `/health`. Check that execution is enabled and the polling, sending,
+     worker, and observer checks have recent heartbeats without ongoing errors.
+   - Send `/projects`, select your project and an idle existing conversation,
+     then use `/current` to confirm the target. If you have no conversation yet,
+     create one in Codex in that same directory, complete one simple text
+     exchange, and refresh `/sessions`.
+   - Send a small test: `Reply only: connection successful. Do not modify files
+     or run commands.` Confirm that it runs in the chosen conversation and that
+     its complete answer returns to Telegram. `/health` alone does not prove this.
+
+   To change settings later, stop **your own** foreground service with Ctrl+C
+   while tasks and delivery are idle, edit, and start it again. Do not run two
+   pollers for one bot. The bundled `.command` scripts only perform pairing;
+   they do not register the menu or start the service. For unattended use,
    configure your own user LaunchAgent with absolute paths and private logs.
 
 The built-in event observer works without changing Codex configuration. An
 optional completion callback is documented in the
 [Chinese operating guide](README.zh-CN.md#可选的完成回调); preserve any existing
 callback before adding it.
+
+## Installation troubleshooting
+
+The CLI deliberately hides exception details because a network error can contain
+the token URL. Use the error type, Telegram code, and the stage that failed:
+
+| Symptom | What to check |
+| --- | --- |
+| `python3` missing, below 3.9, or import failure | Install a compatible Python and use that same interpreter for every command. No third-party Python packages are required. |
+| `FileNotFoundError` before the first run | Enter the source directory and complete `setup`; `token` and the generated `settings.json` must exist there. |
+| `Rejected` with Telegram code 401 or 404 during setup | Check the Bot Token from BotFather. If no `settings.json` was created, run `setup` again with the correct token. |
+| `RuntimeError` before a pairing link appears | An existing `settings.json` prevents re-pairing; edit that configuration. Otherwise, copy the complete BotFather token again without whitespace. A webhook may also own this bot: use a new dedicated bot. The bridge does not remove webhooks. |
+| Pairing times out after a link was printed | Send the exact new challenge to the correct bot in a private chat. If no `settings.json` exists, rerun `setup` to get a fresh challenge. |
+| `URLError`, timeout, or repeated polling failures | Check Telegram connectivity and the explicit HTTP proxy. For HTTPS certificate errors, repair the Python installation's certificate trust; do not disable TLS verification. |
+| Telegram code 409 | Another poller may be using the same bot. Stop your duplicate instance or use a separate bot; do not stop unrelated services. |
+| `JSONDecodeError` or startup failure after editing settings | Run the JSON syntax check above. Fix the existing file; preserve pairing fields and keep `projects` an object of names to absolute directory paths. |
+| `BlockingIOError` when starting | This checkout already has a running bridge. Do not start a second instance or remove its lock. |
+| Empty session list or persistent observer errors | Open Codex and verify its database location, compatibility, and read access. For an empty list, also check that the configured directory exactly matches the conversation's working directory. |
+| `DESKTOP_OFFLINE`, `START_FAILED`, or no `queue --thread` support | Repeat the Desktop and CLI checks in step 2. Pairing success does not establish Codex compatibility. Do not blindly resubmit a task with an uncertain submission result. |
 
 ## Commands
 

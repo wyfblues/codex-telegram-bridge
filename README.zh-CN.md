@@ -99,6 +99,8 @@ Codex Telegram Bridge 是一个运行在 Mac 上的开源 Telegram 机器人。
 - Telegram BotFather 创建的专用 Bot，不应被其他轮询程序或 webhook 共用。
 - 本机 Codex 的 `state_5.sqlite` 与 rollout 记录。其内部结构可能随版本变化。
 
+无需安装第三方 Python 包，也不需要 Telegram 的 `api_id`／`api_hash`、公网服务器或开放入站端口。
+
 默认 CLI 路径为 `/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex`。
 CLI 安装位置不同时，通过环境变量指定。注意：当前 Desktop 运行检测仍只识别
 `/Applications/ChatGPT.app/Contents/MacOS/ChatGPT`；单独修改 CLI 路径不能改变这一限制。
@@ -113,32 +115,130 @@ export CODEX_THREAD_DB="$HOME/.codex/state_5.sqlite"
 
 ## 配置与启动
 
-1. 将项目保存在仅本人可访问的本机目录中。源码与运行数据共用同一个目录，
-   私有运行文件由 `.gitignore` 排除。不要让两个服务同时轮询同一个 Bot。
-2. 运行配对程序；Token 在终端隐藏输入，不要写入命令行或聊天：
+以下流程在终端中运行服务，不安装后台服务。所有命令都在源码目录执行，并使用同一个 Python。
+
+1. **下载源码，进入目录。** 已安装 Git 时运行：
+
+   ```sh
+   git clone https://github.com/wyfblues/codex-telegram-bridge.git
+   cd codex-telegram-bridge
+   chmod 700 .
+   ```
+
+   也可以下载 GitHub ZIP，解压后在源码目录打开终端，并运行 `chmod 700 .`。源码与运行数据共用这个目录，
+   私有运行文件由 `.gitignore` 排除。
+
+2. **先检查 Python 和 Codex。** 在电脑上打开 Codex、登录，并在准备接入的项目目录中
+   创建会话，发送一条简单文字并等答复结束；只打开空白会话可能尚未生成可续接的记录。
+   然后检查默认 CLI：
+
+   ```sh
+   python3 --version
+   export CODEX_CLI="/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
+   "$CODEX_CLI" --version
+   "$CODEX_CLI" queue --help
+   ```
+
+   Python 需为 3.9 或更新版本，CLI 必须能运行，`queue` 帮助中应有 `--thread`。
+   不满足时先解决安装或版本兼容问题。当前 Desktop 运行检测只识别上方列出的
+   `ChatGPT.app` 进程路径；仅修改 `CODEX_CLI` 不能解决 `Codex.app` 等其他安装名称的兼容性，
+   不要通过重命名应用绕过检测。
+
+   会话发现还需要已有的 Codex 数据库，默认是 `$HOME/.codex/state_5.sqlite`。
+   位置不同时，在当前终端设置 `CODEX_THREAD_DB` 为其绝对路径；不要创建空库，
+   也不要复制别人的数据库。CLI 路径不同时，修改上面的 `CODEX_CLI` 值。
+   将来使用 LaunchAgent 时，也需在它的环境中设置这些变量。
+
+3. **创建自己的 Bot，完成配对。** 在 Telegram 打开官方 [BotFather](https://t.me/BotFather)，
+   发送 `/newbot`，按提示填写显示名称和以 `bot` 结尾的用户名，取得自己的 Bot Token。
+   可参考 [Telegram 官方创建说明](https://core.telegram.org/bots/features#creating-a-new-bot)。
+   使用专用 Bot，不要与其他轮询程序或 webhook 共用。然后运行：
 
    ```sh
    python3 bridge.py setup
    ```
 
-3. 按终端提示向自己的 Bot 发送带随机验证码的 `/start` 消息。验证码十分钟失效。
-   程序生成权限为 `0600` 的 `token` 与 `settings.json`，远程执行默认关闭。
-4. 编辑生成的 `settings.json`，保留配对字段，将 `projects` 配成项目名称到真实
-   绝对目录的映射。理解执行权限后，可将 `execution_enabled` 设为 `true`。
-   `settings.example.json` 仅作结构参考，不要用它覆盖已配对设置。
+   在 `Paste BotFather token (hidden):` 后粘贴 Token，输入不会显示。
+   不要把 Token 写进命令、README、Issue 或 Telegram 消息。接下来会询问代理：
+
+   - Mac 能直接连接 Telegram：直接回车，留空。
+   - 需要代理：填写自己的 HTTP 代理地址，例如 `http://127.0.0.1:7890`，端口按实际修改。
+     当前不支持 SOCKS 地址。
+
+   留空会直连，不会自动沿用系统代理或 `HTTPS_PROXY`。`setup` 的代理通过这个输入框填写，
+   不要用 `setup --proxy` 传入。
+
+   保持终端打开，进入它打印出的 Bot 链接，从自己的私人账号向 Bot 发送**完整的**
+   `/start <challenge>`，其中验证码必须使用终端本次显示的值。只点“开始”不够。
+   配对窗口约十分钟；成功后终端显示 `Paired.`，并生成 `token`、`settings.json`
+   （两者权限均为 `0600`）和 `state.sqlite3`，远程执行默认关闭。
+   聊天 ID、用户 ID 和 Bot ID 都会自动生成，无需自己查找填写。
+
+4. **配置项目。** 用纯文本编辑器打开刚生成的 `settings.json`，在原文件中修改这些字段：
+
+   ```json
+   {
+     "projects": {
+       "demo": "/absolute/path/to/your/project"
+     },
+     "execution_enabled": true
+   }
+   ```
+
+   示例路径要换成已经存在的项目绝对目录，并与 Codex 会话的工作目录完全相同。
+   不要用 `~`、另一个 worktree 或符号链接别名。`demo` 是菜单名称，可以自行修改。
+   `execution_enabled: true` 会允许已配对账号发送任务。
+   上面是**配置片段**，不能整段替换原文件；保留配对生成的 `proxy`、`chat_id`、
+   `user_id`、`bot_id` 和 `bot_username`。不要用 `settings.example.json` 覆盖原文件。
+
+   进度、图片发送、图片接收和清理默认关闭。需要时，在原配置中添加
+   `progress_cards_enabled`、`image_delivery_enabled`、`image_receive_enabled`、
+   `image_cleanup_enabled` 并设为 `true`。检查 JSON 语法时无需打印私人配置：
+
+   ```sh
+   python3 -m json.tool settings.json >/dev/null
+   ```
+
    `new_thread_defaults` 留空时沿用个人 Codex 配置；也可添加 `model` 和
    `model_reasoning_effort` 来指定新建会话的默认设置。
-5. 注册菜单并启动：
+
+5. **注册菜单，启动并验收。** 注册一次即可，成功输出包含 `"verified": true`；随后启动前台服务：
 
    ```sh
    python3 configure_menu.py
    python3 bridge.py run
    ```
 
-在 Telegram 使用 `/projects` → 选择项目 → 选择会话或新建会话 → 发送文字。
-源码、配置与数据库均位于本项目目录。长期运行可自行配置用户级
-LaunchAgent，使用 Python 和脚本的绝对路径，并将日志放在私有运行目录。
-本仓库不安装或改动任何现有后台服务。
+   保持终端打开、Mac 唤醒并联网。服务空闲时可能没有输出。在配对的 Telegram 私聊中：
+
+   - 发送 `/health`，确认远程执行已启用，接收、发送、执行和观察器心跳近期更新，且没有持续异常。
+   - 发送 `/projects`，选择项目和空闲的已有会话；再用 `/current` 确认目标。
+     尚无会话时，先在电脑上的 Codex 同一目录创建会话，完成一次简单文字交互，再刷新 `/sessions`。
+   - 发送一个小测试：`只回复：连接成功。不要修改文件或运行命令。`
+     确认选定的原会话实际执行，并且完整答复回到 Telegram。只看到 `/health` 回复不能证明这一步。
+
+之后修改配置时，等任务和发送空闲，用 Ctrl+C 停止**自己启动的**前台服务，修改后重新运行。
+不要让两个服务同时轮询同一个 Bot。仓库附带的 `.command` 脚本只负责配对，
+不会注册菜单或启动服务。长期运行可自行配置用户级 LaunchAgent，使用绝对路径和私人日志目录。
+时间显示目前固定为 `Asia/Shanghai`。
+
+## 安装时遇到问题
+
+终端会隐藏异常详情，因为网络错误可能带有 Token URL。可以结合异常类型、Telegram 错误码和失败阶段判断：
+
+| 现象 | 检查与处理 |
+| --- | --- |
+| 找不到 `python3`、版本低于 3.9 或导入失败 | 安装兼容的 Python，所有命令使用同一个解释器；无需第三方 Python 包。 |
+| 首次启动前出现 `FileNotFoundError` | 进入源码目录并先完成 `setup`，确认这里已有 `token` 和生成的 `settings.json`。 |
+| 配对时出现 `Rejected`，Telegram 错误码 401 或 404 | 检查 BotFather 提供的 Token；若尚未生成 `settings.json`，可重新运行 `setup` 输入正确 Token。 |
+| 尚未出现配对链接就报 `RuntimeError` | 若已有 `settings.json`，会拒绝重复配对，应编辑原配置；否则先重新复制完整的 BotFather Token，去掉多余空白；也可能是 Bot 已有 webhook，请使用新的专用 Bot。程序不会删除 webhook。 |
+| 显示配对链接后等待超时 | 向正确 Bot 的私聊发送本次完整验证码。尚无 `settings.json` 时，重新运行 `setup` 取得新验证码。 |
+| `URLError`、超时或轮询持续失败 | 检查 Telegram 连通性及显式填写的 HTTP 代理；若为 HTTPS 证书错误，应修复 Python 的证书信任，不要关闭 TLS 校验。 |
+| Telegram 错误码 409 | 可能有另一个程序在轮询同一 Bot；停止自己重复启动的实例，或改用独立 Bot，不要停止无关服务。 |
+| 编辑配置后出现 `JSONDecodeError` 或启动失败 | 执行上方 JSON 语法检查，修复原文件并保留配对字段；`projects` 应是名称到绝对目录的对象。 |
+| 启动时出现 `BlockingIOError` | 此源码目录已有服务运行，不要再启动一份，也不要删除锁文件。 |
+| 会话列表为空或观察器持续异常 | 打开 Codex，检查其数据库位置、兼容性及可读权限；列表为空时还要检查项目目录与会话工作目录是否完全一致。 |
+| `DESKTOP_OFFLINE`、`START_FAILED` 或 CLI 不支持 `queue --thread` | 重做第 2 步的 Desktop 和 CLI 检查；配对成功不代表 Codex 兼容。提交结果待确认时，不要盲目重复发送任务。 |
 
 ## 一个目录，选择性纳入 Git
 
