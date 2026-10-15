@@ -5,35 +5,35 @@
 ![macOS](https://img.shields.io/badge/macOS-local--first-161B22)
 [![MIT License](https://img.shields.io/badge/License-MIT-7AC9B0)](LICENSE)
 
-**Leave your desk. Keep your Codex conversation going.**
+**Get Codex results in Telegram. Reply to keep working in the same session.**
 
 English · [简体中文](README.zh-CN.md)
 
-Codex is still checking code or running tests, but you need to head out. Later,
-you want to read the result, ask a follow-up, or send a screenshot of something
-you noticed. Codex Telegram Bridge connects your phone's Telegram chat to Codex
-on your Mac, so you can keep working without returning to your desk.
+Codex Telegram Bridge is an open-source bot that connects a private Telegram
+chat to Codex on your Mac. Choose a project and conversation, send a task, and
+receive its progress and full answer in Telegram. Reply to the result to
+continue the original conversation with its context and execution settings.
 
-Choose a project and an existing conversation, then send your task. It continues
-in the original Codex session with its context and execution settings. When the
-answer arrives, reply to that message to continue the same conversation, even
-if you have since selected a different project. There is no need to explain the
-background again or keep track of which chat a result belongs to.
+If Telegram is where you already check messages, you can follow your Codex work
+there too. Read a result, ask for another change, or send a screenshot without
+switching to a separate app to find the conversation.
 
-You can follow the work without filling your chat with updates. An optional
-progress card edits the same message with status, elapsed time, and the latest
-public progress. The full final answer arrives separately; long answers are
-split without truncation. Send one photo with a caption to an existing session,
-receive previews of local images attached to Codex's final answer, and request
-the original files when you need the detail. Optional cleanup manages those
-image copies without touching project originals.
+[Official Codex on mobile](https://learn.chatgpt.com/docs/mobile) also connects to
+your computer and continues existing conversations. This project gives that
+workflow a Telegram entry point, with a few deliberate choices:
 
-The bridge runs on your own Mac using the Python standard library. Your projects
-and task execution stay there, and only the paired private Telegram account can
-submit work. Ordinary code handles polling, routing, notifications, progress,
-and image management, without an extra model dispatching requests. Keep your Mac
-awake, online, and Codex available, and your phone becomes another way to pick up
-the work you already started.
+- **Reply to the result you mean.** Replies target that message's original
+  conversation, even after you select a different project.
+- **Keep progress in one message.** An optional card updates in place. The full
+  final answer arrives separately, split without truncation when it is long.
+- **Send screenshots and get original images back.** Send one photo with a
+  caption; receive previews of local images attached to a final answer, with a
+  button to request the original file. Optional cleanup retains incoming copies
+  for 7 days and outgoing original copies for 30 days, protects active tasks and
+  pending deliveries, and leaves project originals alone.
+- **Run and change the bridge yourself.** It uses the Python standard library
+  and MIT-licensed source. Routing and notifications need no extra dispatcher
+  model; Codex tasks still use your existing account and model.
 
 ![Telegram to local Codex workflow](docs/images/overview.png)
 
@@ -46,6 +46,53 @@ the work you already started.
 
 *The visuals use fictional projects, conversations, messages, and images. They
 are an illustrative demo, not a recording of a private conversation.*
+
+## How does it compare with official Codex on mobile?
+
+The official app already supports local conversations, progress, notifications,
+and attachments. It also offers command approvals, code diffs, and guidance for
+work that is already running. Those are useful reasons to choose it.
+Sources: [mobile guide](https://learn.chatgpt.com/docs/mobile),
+[remote connections](https://learn.chatgpt.com/docs/remote-connections), and
+[mobile workflow guide](https://learn.chatgpt.com/blog/mastering-codex-remote-for-engineering).
+
+| Your workflow | Official Codex on mobile | This bridge |
+| --- | --- | --- |
+| Where you work from | Codex in the ChatGPT mobile app | A paired private Telegram chat |
+| Where tasks run | Cloud or a connected Mac or Windows computer | Configured projects on your Mac |
+| Continue an existing conversation | Supported | Supported; replying to a delivered result selects its original conversation |
+| Follow progress and results | Task views and notifications | One updating progress card and full answers in the chat |
+| Approve commands and review code | Approval controls, changed files, and diffs | Text and image results; no approval or dedicated diff interface |
+| Guide an active task | Queue and steering controls | Follow up after the task ends; no live steering or user-managed backlog |
+| Set it up and maintain it | Pair supported devices in the official apps | Run your own Python service and maintain compatibility with Codex |
+
+Choose the official app when you want to review code, handle approvals, or manage
+active work from your phone. Choose this bridge when you mainly want to receive
+results and send follow-ups in Telegram, and are comfortable maintaining a local
+service. Both ways of working on your own computer need that host awake and
+online. Messages and attached images sent through this bridge pass through
+Telegram.
+
+## How does it compare with other Telegram bridges?
+
+Existing projects also support conversation continuation, progress, and images.
+Their workflows are worth comparing before you choose:
+
+| Project | Main focus in its published documentation |
+| --- | --- |
+| [Codex Telegram Frontend](https://github.com/anton88vlc/codex-telegram-frontend/blob/fb3b296ab5675cd05449673f972bcc6c5852d751/README.md) | A Desktop frontend organized around project groups and conversation topics, with approvals, plans, and file-change progress |
+| [jvogan/telegram-codex-bridge](https://github.com/jvogan/telegram-codex-bridge/blob/e5ab6e2e94fac5bff80fe7bee1727ccd142de007/README.md) | A bridge to existing Desktop conversations, with files, images, voice, and optional live calls |
+| [Codex Telegram Bot](https://github.com/woosungchoi/codex-telegram-bot/blob/9a801ca39ad901bf623d8a3357308b4d7cc2e818/README.md) | A CLI/SDK bot with project and session menus, a task queue, settings, and maintenance tools |
+
+This bridge focuses on one person's private chat. For example, you receive a
+result from project A, then switch to project B. Replying to A's old result still
+continues A's original conversation. The bridge stores the delivered message's
+conversation mapping, so the current project selection does not redirect that
+reply. Together with one updating progress card, explicit image-retention rules,
+and Python standard-library deployment, this is the workflow the project is
+designed to support. Choose it if you want to manage personal projects in one
+private chat and control how messages return to conversations and how long local
+image copies are kept.
 
 ## How it works
 
