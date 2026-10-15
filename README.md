@@ -1,227 +1,246 @@
 # Codex Telegram Bridge
 
-通过 Telegram 私聊选择本机项目与 Codex 会话、发送任务，并接收最终答复。
-通知、菜单、轮询和路由由普通 Python 处理，不额外调用分发模型。
+[![Tests](https://github.com/wyfblues/codex-telegram-bridge/actions/workflows/tests.yml/badge.svg)](https://github.com/wyfblues/codex-telegram-bridge/actions/workflows/tests.yml)
+![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-3776AB)
+![macOS](https://img.shields.io/badge/macOS-local--first-161B22)
+[![MIT License](https://img.shields.io/badge/License-MIT-7AC9B0)](LICENSE)
 
-这是从个人运行环境整理出的源码版本，面向 macOS，界面以中文为主。
-仓库不包含任何真实 Bot Token、绑定账号、项目列表、会话记录、日志或个人配置。
+**Send a task from your phone. Continue the original Codex session on your Mac.**
 
-## 功能
+English · [简体中文](README.zh-CN.md)
 
-- `/projects`：项目按钮、搜索、翻页和最近使用排序。
-- `/sessions`：当前项目的会话列表，每页五条；明确选择已有或新建会话。
-- `/current`：当前目标、模型与推理设置；`/new`：下一条消息新建会话。
-- `/status`：运行中的本机任务及任务详情；`/last`：补看最终答复。
-- `/health`：接收、扫描、发送和工作线程心跳，以及消息队列状态。
-- 可选执行进度卡片：复用任务接收消息，持续更新状态、耗时和最新公开进展，不逐条推送。
-- `/cancel`：取消尚未提交的任务或停止 Bot 自己启动的 CLI 任务。
-- 回复完成通知可续接对应的原会话，不受当前项目选择影响。
-- 最终答复明确附带的本地图片可自动发送预览，图片下的“发送原图”按钮提供原始文件；
-  回复图片或原图文件也会定位原会话。
-- 可接收单张图片和同条消息中的文字说明，交给已选中或被回复通知对应的原会话处理。
-- 长答复完整拆分；完成回调与本地事件观察器按会话和回合去重。
-- 观察器按会话保存读取进度，归档或恢复记录不会从头补推；仅转发监控启用后的完成事件，
-  并显示事件的实际完成时间。旧路径进度自动迁移，缺少有效时间的扫描事件不会作为新通知发送。
-- 桌面会话通过官方 `codex queue --thread` 交回 Desktop；Bot 创建的 CLI 会话使用 `codex exec resume`。
+A small Python bridge between a paired Telegram private chat and local Codex
+sessions. Choose a project, continue a conversation, follow its public progress,
+and receive the full final answer. Routing, polling, and delivery use ordinary
+Python, with no extra model acting as a dispatcher.
 
-只有配对成功的私人聊天和用户可以发起任务。完成通知表示模型回合结束，
-不保证业务验收成功；Telegram 发送回执也不表示收件人已读。
+![Telegram to local Codex workflow](docs/images/overview.png)
 
-## 环境要求
+<details>
+<summary>Watch the 10-second illustrated walkthrough</summary>
 
-- macOS，Python 3.9 或更新版本，仅使用标准库。
-- 已安装、登录 Codex；续接桌面会话需要 Desktop 运行，且其 CLI 支持 `queue --thread`。
-- Telegram BotFather 创建的专用 Bot，不应被其他轮询程序或 webhook 共用。
-- 本机 Codex 的 `state_5.sqlite` 与 rollout 记录。其内部结构可能随版本变化。
+![Project selection, a single progress card, and a final reply in Telegram](docs/images/demo.gif)
 
-默认 CLI 路径为 `/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex`。
-CLI 安装位置不同时，通过环境变量指定。注意：当前 Desktop 运行检测仍只识别
-`/Applications/ChatGPT.app/Contents/MacOS/ChatGPT`；单独修改 CLI 路径不能改变这一限制。
+</details>
+
+*The visuals use fictional projects, conversations, messages, and images. They
+are an illustrative demo, not a recording of a private conversation.*
+
+This is an independent, personal-use project for macOS. The bot's messages and
+menus are currently mostly in Chinese. It relies on local Codex interfaces that
+can change; it is not an official OpenAI or Telegram integration.
+
+## How it works
+
+Telegram sends commands to a local Python service. The service checks both the
+paired private chat and user, fixes the target session, and submits the task:
+
+- Existing Desktop sessions use `codex queue --thread` to continue in Desktop.
+- Bot-created CLI sessions use `codex exec resume`.
+- Local completion events and an optional Codex `notify` callback feed one
+  deduplicated outbox. Replies to delivered notifications target the original
+  session, independently of the currently selected project.
+
+SQLite stores routing, queue state, receipts, and event checkpoints beside the
+source. Image copies stay in private, Git-ignored directories. No database
+server, Python package installation, or dispatcher model is required.
+
+## Features
+
+| Capability | What is supported |
+| --- | --- |
+| Project and session selection | Search, pagination, recent sessions, and explicit selection of an existing or new conversation |
+| Original-session continuation | Preserve the original execution settings; refuse continuation when they cannot be retained |
+| Progress cards | Optional state, elapsed time, and latest public commentary in one message; edits at most every 10 seconds |
+| Full final answers | Long replies split without truncation; callback and observer notices deduplicate by thread and turn |
+| Image delivery | Explicit local images in final answers become previews or original files, with a button to request the original |
+| Image input | One photo with its caption, sent to an explicitly selected or notification-linked existing session |
+| Image retention | Optional 7-day incoming and 30-day original-copy cleanup, protecting active tasks and pending deliveries |
+| Status and recovery | Task panels, health checks, recent results, and conservative handling of uncertain submission or delivery |
+
+Final answers remain separate from the progress card. A turn ending does not
+prove that its requested business outcome succeeded, and a Telegram send receipt
+does not prove that a person read the message.
+
+## Quick start
+
+Allow about five minutes once the prerequisites are ready. Setup is manual and
+does not install or replace a background service.
+
+You need macOS, Python 3.9+, a signed-in local Codex installation, and a dedicated
+bot created with [BotFather](https://t.me/BotFather). Do not share that bot with
+another poller or webhook. Desktop continuation also requires a running Desktop
+app and a CLI that supports `queue --thread`.
+
+**Check the installation paths first.** The current CLI default is
+`/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex`. Desktop process
+detection is hard-coded to `/Applications/ChatGPT.app/Contents/MacOS/ChatGPT`.
+Setting `CODEX_CLI` changes the CLI path but does not change that detection; an
+installation named `Codex.app` is not automatically compatible with this check.
+
+For a different CLI or local database path, set these **before** setup and run:
 
 ```sh
 export CODEX_CLI="/absolute/path/to/codex"
 export CODEX_THREAD_DB="$HOME/.codex/state_5.sqlite"
 ```
 
-`CODEX_HOME` 可调整默认 Codex 数据目录。使用 LaunchAgent 时，需在其环境中
-明确设置这些值。时间显示目前固定为 `Asia/Shanghai`。
+`CODEX_HOME` can change the default Codex data directory. Set these variables in
+the LaunchAgent environment too if you use one. The bridge currently displays
+times in `Asia/Shanghai`.
 
-## 配置与启动
-
-1. 将项目保存在仅本人可访问的本机目录中。源码与运行数据共用同一个目录，
-   私有运行文件由 `.gitignore` 排除。不要让两个服务同时轮询同一个 Bot。
-2. 运行配对程序；Token 在终端隐藏输入，不要写入命令行或聊天：
+1. Clone into a private local directory and pair the bot:
 
    ```sh
+   git clone https://github.com/wyfblues/codex-telegram-bridge.git
+   cd codex-telegram-bridge
+   chmod 700 .
    python3 bridge.py setup
    ```
 
-3. 按终端提示向自己的 Bot 发送带随机验证码的 `/start` 消息。验证码十分钟失效。
-   程序生成权限为 `0600` 的 `token` 与 `settings.json`，远程执行默认关闭。
-4. 编辑生成的 `settings.json`，保留配对字段，将 `projects` 配成项目名称到真实
-   绝对目录的映射。理解执行权限后，可将 `execution_enabled` 设为 `true`。
-   `settings.example.json` 仅作结构参考，不要用它覆盖已配对设置。
-   `new_thread_defaults` 留空时沿用个人 Codex 配置；也可添加 `model` 和
-   `model_reasoning_effort` 来指定新建会话的默认设置。
-5. 注册菜单并启动：
+   Enter the token in the terminal's hidden prompt. Send the displayed
+   `/start <challenge>` to your bot from your private Telegram account within
+   10 minutes. Setup creates local `token` and `settings.json` files with `0600`
+   permissions; remote execution starts disabled.
+
+2. Edit the generated `settings.json`, preserving its pairing fields. Set
+   `projects` to your own absolute directories and enable execution when ready:
+
+   ```json
+   {
+     "projects": {
+       "demo": "/absolute/path/to/your/project"
+     },
+     "execution_enabled": true
+   }
+   ```
+
+   This is a fragment, not a replacement configuration. Use
+   [settings.example.json](settings.example.json) for the full structure, and
+   never overwrite the paired file with the example. Optional features are
+   disabled by default: `progress_cards_enabled`, `image_delivery_enabled`,
+   `image_receive_enabled`, and `image_cleanup_enabled`.
+
+3. Register the menu and run the service:
 
    ```sh
    python3 configure_menu.py
    python3 bridge.py run
    ```
 
-在 Telegram 使用 `/projects` → 选择项目 → 选择会话或新建会话 → 发送文字。
-源码、配置与数据库均位于本项目目录。长期运行可自行配置用户级
-LaunchAgent，使用 Python 和脚本的绝对路径，并将日志放在私有运行目录。
-本仓库不安装或改动任何现有后台服务。
+   In Telegram, send `/projects`, choose a project and conversation, then send a
+   task. Use `/health` to check the connection. Keep this terminal running, or
+   configure your own user LaunchAgent with absolute paths and private logs.
 
-## 一个目录，选择性纳入 Git
+The built-in event observer works without changing Codex configuration. An
+optional completion callback is documented in the
+[Chinese operating guide](README.zh-CN.md#可选的完成回调); preserve any existing
+callback before adding it.
 
-源码和本机运行数据放在同一个目录，不需要维护第二份代码或同步目录。
-Git 只跟踪源码、测试、示例配置和文档。Token、真实配置、数据库、日志与备份
-始终留在本机，并由 `.gitignore` 排除。不要使用 `git add -f` 强行添加这些文件。
+## Commands
 
-更新流程：修改代码 → 跑离线测试 → 检查暂存文件和差异 → 本地提交 → 在没有 Bot
-CLI 任务运行时重启服务 → 用 `/health` 检查。服务不会自动热重载；notify 回调是
-短进程，下次调用会读取新代码。不要用旧数据库或旧个人配置覆盖现有运行数据。
+| Command | Purpose |
+| --- | --- |
+| `/projects [keyword]` | Browse or search configured projects |
+| `/sessions [keyword]` | Browse or search the selected project's conversations |
+| `/current` | Show the current target, model, and reasoning setting |
+| `/new` | Create a new conversation for the next text task |
+| `/status` | Inspect local running tasks and task panels |
+| `/last` | Retrieve the selected conversation's latest final answer |
+| `/cancel` | Cancel an unsubmitted task or stop a bot-owned CLI task |
+| `/health` | Inspect polling, observation, delivery, and optional features |
 
-## 可选的完成回调
+Replying to a delivered result, image, or progress card takes precedence over
+the project selection. It continues that message's original session without
+changing your selection.
 
-服务自带本地结束事件观察器。还可以在个人 Codex `config.toml` 配置 `notify`，
-指向唯一源码仓库中的 `notify_hook.py`，与观察器去重。修改前保存已有回调；若存在，
-将其命令数组保存在运行目录的 `original-notify.json` 中，由新回调继续调用。
-不要直接覆盖已有回调或提交原始个人配置。
+## Images and progress
 
-```toml
-notify = ["/absolute/path/to/python3", "/absolute/path/to/notify_hook.py"]
-```
+Enable optional features in the local settings, run the offline tests, and
+restart only while bot tasks and message delivery are idle. The service does
+not hot-reload its configuration or source.
 
-全面停用时，同时停止服务并恢复原 notify 回调。只停止后台服务，回调仍可能入队。
+- **Progress:** one card per tracked turn, showing only explicitly public
+  commentary. Reasoning, prompts, and tool logs are excluded. Terminal cards
+  freeze, and editing failures do not create replacement messages.
+- **Incoming:** send one PNG/JPEG photo with a caption to an existing session.
+  Telegram may compress photos; downloads are limited to 20 MB. Desktop receives
+  a validated local path and instructions to open the image; CLI continuation
+  uses `--image`.
+- **Outgoing:** attach an absolute local path to the final answer with Markdown
+  image syntax. PNG/JPEG previews up to 10 MB are preferred; originals and other
+  supported image formats use file delivery. The maximum is 50 MB per image and
+  10 images per turn. Remote image URLs are not downloaded.
+- **Cleanup:** incoming copies retain 7 days, outgoing original copies 30 days.
+  Active and queued task references, pending or uncertain deliveries, and shared
+  protected copies defer deletion. Project originals are never cleanup targets.
+  Expired original buttons explain that the local copy is no longer available.
 
-## 执行进度卡片
-
-在个人 `settings.json` 中将 `progress_cards_enabled` 设为 `true`，通过离线测试后，
-等 Bot 任务与发送队列空闲再重启服务。默认关闭；`/health` 显示开关状态。
-
-Telegram 发起的任务复用接收回执作为进度卡片；启用后新开始的本机主会话回合也会有
-一张卡片。卡片显示项目、会话、排队或执行状态、耗时，以及最新一条明确标为公开
-commentary 的进展。快速变化会合并，同一条消息每 10 秒最多编辑一次。不会发送推理、
-工具日志、用户输入或无法确认属于当前回合的文字，也不会补推启用或重启前的历史卡片。
-
-结束、失败、取消或确认中断后冻结卡片耗时；“本轮已结束”仅表示 Codex 回合结束。
-完整最终答复及图片仍按原方式发送，可回复卡片继续其原会话。已交给 Desktop 的任务
-仍须在原桌面会话停止。提交状态不确定或服务重启不会自动重跑任务。
-
-卡片编辑失败不会另发替代消息。限流遵守等待时间并合并新进度；消息被删除或拒绝编辑
-后停止更新。首次发送结果不确定时不会重发。关闭开关后停止新卡片与已有卡片编辑，
-任务执行、原有通知和图片功能继续使用原流程。进度监听和编辑均由普通 Python 完成。
-
-## 图片预览与原图
-
-在个人 `settings.json` 中将 `image_delivery_enabled` 设为 `true`，并在没有 Bot
-任务执行或消息发送时重启服务。默认关闭；`/health` 显示当前图片发送开关。
-
-任务最终答复应使用 Markdown 图片语法附上本机绝对路径，例如：
+Example final-answer attachment:
 
 ```md
-![页面截图](/absolute/path/to/screenshot.png)
-![页面截图](</absolute/path/with spaces/screenshot.png>)
-![原图](/absolute/path/to/export.png)
+![Screenshot](/absolute/path/to/screenshot.png)
+![Original](/absolute/path/to/export.png)
 ```
 
-普通图片默认发送预览，并带“发送原图”按钮；以 `原图` 或 `original` 开头的
-图片说明会直接发送文件。PNG、JPEG 在 10 MB 内优先预览；GIF、WebP、较大图片，
-以及 Telegram 明确拒绝的预览会按原图文件发送。单张文件最大 50 MB，单轮最多 10 张，
-超限或文件不可读会单独提示，文字答复仍然发送。图片说明过长时只截短图片 caption，
-最终文字答复仍保留全文。
+An alt label beginning with `original` or `原图` requests direct original-file
+delivery. See the [Chinese guide](README.zh-CN.md) for format details, retention
+rules, and operational recovery.
 
-只读取最终答复明确附带的本地图片，不遍历项目或工具日志；不下载远程图片，
-不处理代码示例中的图片链接，也不补发启用前的历史图片。纯工具画面需先保存成文件。
-Telegram 发起的任务会自动收到交付格式提示；桌面直接执行的任务也可使用上述格式。
+## Privacy and execution boundaries
 
-图片入队时复制到被 Git 忽略的私有 `media/` 目录，按内容校验，防止源文件随后变化。
-原图按钮不调用模型，同一张预览重复点击只入队一次；发送超时维持“送达待确认”，
-不会盲目重发。启用自动清理后，原图副本保留 30 天，图片回执和会话关联继续保留。
-关闭图片发送开关会停止新任务的图片自动入队；已入队消息和已有原图按钮仍可使用。
+- Only the paired private chat and user can submit tasks. Tasks still run with
+  Codex's permissions and project instructions; pairing is not a new sandbox.
+- Project names, conversation titles, public progress, final answers, and
+  explicitly attached images pass through Telegram. Keep secrets out of those
+  outputs. The bridge redacts its exact bot token, not arbitrary sensitive data.
+- The local state database can contain task text, notification content, pairing,
+  and delivery receipts. Protect the entire checkout, its backups, and logs.
+- Source and runtime data share one directory. `.gitignore` excludes credentials,
+  personal settings, databases, logs, backups, and media copies. Check staged
+  files before publishing; ignore rules cannot remove secrets from Git history.
+- Unknown send or submission outcomes are not automatically repeated. Rate
+  limits respect `retry_after`. This favors avoiding duplicate work over blindly
+  retrying a request that might already have succeeded.
 
-## 接收单张图片与说明
+## Known limitations
 
-在个人 `settings.json` 中将 `image_receive_enabled` 设为 `true`，远程执行也须启用，
-安全重启后 `/health` 会显示“图片接收：已启用（单张图片＋说明）”。
+- macOS only, with the `ChatGPT.app` process check described above. Codex database
+  schemas, rollout events, and CLI output are internal compatibility boundaries;
+  recheck them after upgrades. Compatibility with every Desktop release is not
+  claimed.
+- One Telegram execution task at a time. No user-managed backlog, live steering,
+  remote Desktop interruption, approval UI, voice input, general document input,
+  albums, group chat, or multiple users.
+- Image input requires an existing conversation and a caption. If the original
+  model or tools cannot inspect images, the task must say so.
+- A sleeping, offline, or powered-off Mac cannot process commands. Instructions
+  older than 15 minutes are not silently executed.
+- Bot-owned CLI workers hold a power assertion for their own process lifetime.
+  This repository does not install a permanent keep-awake service.
+- UI text is mostly Chinese; displayed times use `Asia/Shanghai`.
 
-先用 `/projects`、`/sessions` 选择已有会话，然后在 Telegram 选择一张照片，
-在发送图片的说明栏填写要求，例如“帮我看看这个报错”，一起发送。
-也可以回复某条任务完成通知，附一张照片和说明，消息会继续那条通知的原会话。
-图片回复仍优先于当前项目选择，接收后切换项目不会改变已经固定的任务目标。
-
-第一版仅支持普通图片消息中的一张 PNG/JPEG 图片与同条 caption，不支持相册、
-以文件形式发送的图片、没有说明的图片或自动创建新会话。没有选定原会话时会明确提示。
-Telegram 的 `photo` 列表是同一张图片的多种分辨率，服务会选择最大的可用版本；
-图片方式可能已经由 Telegram 压缩，下载版本最大 20 MB。超过十五分钟的消息不执行。
-
-身份和任务目标校验通过后，普通 Python 工作线程下载图片到私有 `incoming/`，
-在提交前检查内容校验值。桌面会话的官方 `codex queue` 当前拒绝原生图片附件，
-因此把本机图片路径与“先调用图片查看工具再回答”的要求交给原会话；
-CLI 原会话使用 `resume --image` 附件参数。两种方式都保留原会话执行设置。
-若原模型或工具无法查看图片，应明确告知，不能猜测图片内容。
-
-入队只是接收成功，图片下载、会话提交和识图完成是不同步骤。下载或校验失败不会启动
-任务；提交结果不确定时不自动重试。收到新图片不会运行额外的分发模型。
-`incoming/` 由 Git 忽略，权限仅限当前用户。启用自动清理后，接收图片保留 7 天。
-
-## 图片自动清理
-
-在个人配置启用 `image_cleanup_enabled` 并安全重启后，服务启动时和此后每小时检查一次。
-接收图片 `incoming/` 保留 7 天，发送原图副本 `media/` 保留 30 天，按最近一次接收或
-交付及副本文件更新时间中较新的时间计算；相同内容的新交付会延长共享副本的保留期。
-
-正在排队或执行的任务、待发送/发送中/送达待确认的图片，以及排队或执行中的原会话所关联的
-图片，均暂不删除；共享文件只要有任意受保护引用就保留。无法确认原会话运行状态时，
-本次清理跳过。保护解除后，已超过保留期的图片会在下一次检查清理。
-
-清理仅处理上述两个私有目录下由 Bot 管理的内容校验文件名，不递归、不跟随符号链接，
-不删除项目里的原始图片、聊天文字、消息回执、会话映射或凭据。清理前再次检查文件是否
-被替换，图片入队/保存与清理使用数据库事务串行协调。旧副本和异常退出留下的完整图片
-会自动纳入检查，其他文件不会清理。
-
-过期原图按钮会提示“原图本机副本已过期或已清理（保留 30 天）”，不再入队发送；
-已经发送过的原图仍可在 Telegram 聊天记录中查看。接收图片清理后，原会话仍保留聊天
-文字，若要再次查看旧图，需要重新发送。清理由普通 Python 完成，不调用模型；
-`/health` 显示开关、上次检查时间和删除数量。个别文件删除失败不会中断收发服务。
-
-## 执行与隐私边界
-
-- 任务在本机执行，沿用 Codex 权限和项目指令。已有会话设置无法保留时拒绝续接。
-- 桌面提交被接受不等于完成；仅跟踪关联的请求与回合。超时或重启后不自动重复提交。
-- Bot 无法远程取消已交给 Desktop 的任务，应在原桌面会话中停止。
-- 一次处理一个 Telegram 执行任务；接收图片目前仅支持单张图片＋同条说明，
-  暂不支持其他附件、语音、群聊或多用户。
-- 超过十五分钟的待提交指令不会静默执行。Mac 睡眠、断网或关机时不能接收任务。
-- CLI 工作进程使用绑定其 PID 的保活，结束后释放；本仓库不包含个人电脑常驻保活服务。
-- 通知包含会话标题、项目名称与最终答复，并经 Telegram 传输。不要让最终答复包含秘密。
-  内置处理会隐藏本 Bot 的精确 Token，但不是通用敏感信息检测器。
-- 本地状态库含任务文字、通知内容、配对与回执信息，应保留在受保护的运行目录。
-- Telegram 发送结果不确定时不会自动重发；限流会遵守 `retry_after`。
-- 依赖 Codex 当前的数据库、事件格式和 CLI 输出，升级后应重新验证兼容性。
-
-## 开发与提交
+## Testing
 
 ```sh
 python3 -m unittest discover -p 'test_*.py'
 ```
 
-离线测试使用临时数据库及虚构数据，不需要真实 Token，也不会向真实配对账号发送消息。
-真实收发验收须经用户授权，仅发送独立测试图片，并核对回执、原图内容与消息去重。
-`.gitignore` 排除凭据、运行设置、数据库、日志、备份和本机资源。提交前仍应检查
-`git diff --cached` 与 `git ls-files`；忽略规则无法清除已经进入历史的秘密。
+The current code was verified locally with **215 passing offline tests**. This is
+a local validation result, not a claim that hosted CI has passed. Tests use
+temporary databases, mocked transports, and fictional data; no real bot token or
+Telegram recipient is required. Live acceptance is separate and needs a
+deliberately chosen test account and content.
 
-源码尚未指定开源许可证。对外发布前需由维护者选择并加入许可证。
+## License and credits
 
-## 设计参考
+[MIT License](LICENSE). Codex and Telegram belong to their respective owners;
+this project is independently maintained and is not endorsed by either.
 
-以下项目用于交互和可靠性设计参考；不作为安装或运行依赖：
+Design references, not runtime dependencies:
 
+- [Codex Telegram Frontend](https://github.com/anton88vlc/codex-telegram-frontend)
 - [Takopi](https://github.com/banteg/takopi)
-- [codex-telegram-bot](https://github.com/woosungchoi/codex-telegram-bot)
+- [Codex Telegram Bot](https://github.com/woosungchoi/codex-telegram-bot)
 - [tele-codex](https://github.com/emanuel-prado/tele-codex)
 - [Telegram Bot API](https://core.telegram.org/bots/api)
