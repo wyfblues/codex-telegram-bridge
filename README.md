@@ -1,6 +1,6 @@
 # Codex Telegram Bridge
 
-[![Tests](https://github.com/wyfblues/codex-telegram-bridge/actions/workflows/tests.yml/badge.svg)](https://github.com/wyfblues/codex-telegram-bridge/actions/workflows/tests.yml)
+[![Tests](https://github.com/wyfblues/codex-telegram-bridge/actions/workflows/tests.yml/badge.svg?branch=feat%2Finitial-import)](https://github.com/wyfblues/codex-telegram-bridge/actions/workflows/tests.yml)
 ![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-3776AB)
 ![macOS](https://img.shields.io/badge/macOS-local--first-161B22)
 [![MIT License](https://img.shields.io/badge/License-MIT-7AC9B0)](LICENSE)
@@ -226,11 +226,12 @@ rules, and operational recovery.
 python3 -m unittest discover -p 'test_*.py'
 ```
 
-The current code was verified locally with **215 passing offline tests**. This is
-a local validation result, not a claim that hosted CI has passed. Tests use
-temporary databases, mocked transports, and fictional data; no real bot token or
-Telegram recipient is required. Live acceptance is separate and needs a
-deliberately chosen test account and content.
+The suite contains **215 offline tests**, verified locally and run in GitHub
+Actions on Ubuntu and macOS with Python 3.9 and 3.12. The badge above links to
+the latest hosted result. Tests use temporary databases, mocked transports,
+and fictional data; no real bot token, Desktop process, or Telegram recipient
+is required. Live acceptance is separate and needs a deliberately chosen test
+account and content.
 
 ## License and credits
 

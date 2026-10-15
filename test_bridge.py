@@ -27,6 +27,10 @@ class BridgeTests(unittest.TestCase):
                     'projects': {'demo': '/tmp/demo'}}
         self.live_patch=patch.object(b,'open_rollout_paths',side_effect=lambda:{str(p) for p in b.ROOT.glob('*.jsonl')})
         self.live_patch.start()
+        # Desktop availability is a fixture, independent of the host's apps.
+        desktop_patch = patch.object(b, 'desktop_available', return_value=True)
+        desktop_patch.start()
+        self.addCleanup(desktop_patch.stop)
     def tearDown(self):
         self.live_patch.stop()
         b.ROOT = self.old; b.THREAD_DB = self.old_thread_db; self.tmp.cleanup()
