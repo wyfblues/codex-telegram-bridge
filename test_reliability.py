@@ -423,9 +423,11 @@ class ReliabilityTests(unittest.TestCase):
             ])
             b.put(c, 'cancel-job', 410)
         first, second = FakeProcess('first', 900410, True), FakeProcess('second', 900411, False)
+        # Force the first poll through the heartbeat barrier regardless of clock epoch.
         with patch.object(b.subprocess, 'Popen', side_effect=[first, FakeAwake(), second, FakeAwake()]), \
                 patch.object(b.threading, 'Thread', CapturedWatcher), \
                 patch.object(b, 'record_health', side_effect=heartbeat), \
+                patch.object(b.time, 'monotonic', return_value=100.0), \
                 patch.object(b.time, 'sleep', side_effect=StopWorker), \
                 patch.object(b, 'ACTIVE_PROCESS', None), \
                 patch.object(b.os, 'killpg', side_effect=ProcessLookupError('Test-only signal guard')) as kill:
