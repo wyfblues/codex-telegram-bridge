@@ -216,7 +216,7 @@ def _time_text(value, tz):
 
 
 def _percent(value):
-    value = round(value, 1)
+    value = round(float(value), 1)
     return str(int(value)) if value.is_integer() else str(value)
 
 
