@@ -5,6 +5,8 @@
   },
   "execution_enabled": false,
   "progress_cards_enabled": false,
+  "remote_controls_enabled": false,
+  "rich_messages_enabled": false,
   "image_delivery_enabled": false,
   "image_receive_enabled": false,
   "image_cleanup_enabled": false,

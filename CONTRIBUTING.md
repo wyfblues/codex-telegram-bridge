@@ -3,6 +3,22 @@
 The bridge uses Python 3.9 or later and the standard library. Keep changes
 focused and preserve unrelated local work.
 
+## Pull request workflow
+
+Publish changes to `main` through a pull request:
+
+1. Develop on a typed working branch based on the latest `origin/main`.
+2. Run the offline tests, review the full diff, and inspect every outgoing
+   commit's English-only ASCII metadata before pushing.
+3. Push the working branch and open a PR targeting `main`, describing the
+   behavior change and validation.
+4. Wait for CI and required reviews, merge without bypassing branch protections,
+   and synchronize the local `main` branch.
+
+Do not push changes directly to `main`. Remote operations require explicit owner
+authorization. Publishing code does not restart or reconfigure a running bridge;
+coordinate runtime activation separately.
+
 ## Validation
 
 Run the offline test suite from the repository root:
