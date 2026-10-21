@@ -12,6 +12,10 @@ COMMANDS = [
     {'command': 'status', 'description': '查看本机正在运行的任务'},
     {'command': 'cancel', 'description': '取消待提交任务或停止 CLI 任务'},
     {'command': 'health', 'description': '检查机器人连接和通知状态'},
+    {'command': 'steer', 'description': '向原会话正在执行的任务补充要求'},
+    {'command': 'stop', 'description': '停止原会话当前回合'},
+    {'command': 'settings', 'description': '调整原会话模型、推理强度和速度'},
+    {'command': 'usage', 'description': '查看额度、重置时间和上下文用量'},
     {'command': 'help', 'description': '查看使用说明'},
 ]
 

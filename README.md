@@ -103,7 +103,9 @@ server, Python package installation, or dispatcher model is required.
 | --- | --- |
 | Project and session selection | Search, pagination, recent sessions, and explicit selection of an existing or new conversation |
 | Original-session continuation | Preserve the original execution settings; refuse continuation when they cannot be retained |
-| Progress cards | Optional state, elapsed time, and latest public commentary in one message; edits at most every 10 seconds |
+| Progress cards | State, elapsed time, public commentary, structured plans, changed-file summaries, model and context samples in one message; edits at most every 10 seconds |
+| Phone controls | Steer or stop a loaded Desktop conversation; select its model, reasoning effort, and advertised Fast tier without changing global settings |
+| Usage | Read account quota/reset times and the selected conversation's latest context sample without invoking a model |
 | Full final answers | Long replies split without truncation; callback and observer notices deduplicate by thread and turn |
 | Image delivery | Explicit local images in final answers become previews or original files, with a button to request the original |
 | Image input | One photo with its caption, sent to an explicitly selected or notification-linked existing session |
@@ -279,11 +281,38 @@ the token URL. Use the error type, Telegram code, and the stage that failed:
 | `/status` | Inspect local running tasks and task panels |
 | `/last` | Retrieve the selected conversation's latest final answer |
 | `/cancel` | Cancel an unsubmitted task or stop a bot-owned CLI task |
+| `/steer <text>` | Append requirements to the selected or replied-to conversation's active turn |
+| `/stop` | Request an exact-turn Desktop interrupt or stop the matching bot CLI task |
+| `/settings` | Open per-conversation model, reasoning, and supported speed buttons |
+| `/model <name>`, `/reasoning <effort>`, `/fast on\|off` | Set validated options for subsequent turns in this conversation |
+| `/usage` | Read account limits, reset times, and the selected conversation's context sample |
 | `/health` | Inspect polling, observation, delivery, and optional features |
 
 Replying to a delivered result, image, or progress card takes precedence over
 the project selection. It continues that message's original session without
 changing your selection.
+
+## Phone controls
+
+Enable `remote_controls_enabled` after testing, then restart while bot work and
+delivery are idle. Controls use the existing Desktop owner through its local
+IPC socket, or an already-running official app-server control socket. They never
+resume a second writer, replace the conversation, or change global Codex settings.
+Model, reasoning and speed choices come from the current model catalog. Settings
+changes require an idle conversation and apply to its next turn.
+
+`/steer` is explicit: ordinary messages retain their existing continuation rules.
+On the current Desktop IPC, steering targets the original conversation's turn
+active when Desktop processes it; that interface cannot atomically pin a turn.
+Interrupts do pin the exact turn. An unavailable owner or uncertain response is
+reported without automatic resubmission. Service recovery also never replays a
+control request.
+
+Quota reads use the locally signed-in account; context is a separate, dated
+sample for the selected conversation. Missing and stale values remain explicit.
+The optional short-lived read client is limited to model/limit queries and never
+starts a thread or inference. Enable `rich_messages_enabled` for safe code blocks,
+bold text, links and readable lists; rejected HTML falls back to the same content.
 
 ## Images and progress
 
@@ -292,7 +321,8 @@ restart only while bot tasks and message delivery are idle. The service does
 not hot-reload its configuration or source.
 
 - **Progress:** one card per tracked turn, showing only explicitly public
-  commentary. Reasoning, prompts, and tool logs are excluded. Terminal cards
+  commentary and bounded structured plan/file metadata. Reasoning, prompts,
+  full code diffs and tool logs are excluded. Terminal cards
   freeze, and editing failures do not create replacement messages.
 - **Incoming:** send one PNG/JPEG photo with a caption to an existing session.
   Telegram may compress photos; downloads are limited to 20 MB. Desktop receives
@@ -340,9 +370,12 @@ rules, and operational recovery.
   schemas, rollout events, and CLI output are internal compatibility boundaries;
   recheck them after upgrades. Compatibility with every Desktop release is not
   claimed.
-- One Telegram execution task at a time. No user-managed backlog, live steering,
-  remote Desktop interruption, approval UI, voice input, general document input,
+- One Telegram execution task at a time. No user-managed backlog,
+  approval UI, voice input, general document input,
   albums, group chat, or multiple users.
+- Steering, Desktop interruption and settings require a compatible loaded owner;
+  arbitrary standalone CLI processes are not adopted. Permission approvals and
+  structured user-input prompts are not part of these controls.
 - Image input requires an existing conversation and a caption. If the original
   model or tools cannot inspect images, the task must say so.
 - A sleeping, offline, or powered-off Mac cannot process commands. Instructions
@@ -357,12 +390,14 @@ rules, and operational recovery.
 python3 -m unittest discover -p 'test_*.py'
 ```
 
-The suite contains **215 offline tests**, verified locally and run in GitHub
+The suite contains **353 offline tests**, verified locally and run in GitHub
 Actions on Ubuntu and macOS with Python 3.9 and 3.12. The badge above links to
 the latest hosted result. Tests use temporary databases, mocked transports,
 and fictional data; no real bot token, Desktop process, or Telegram recipient
 is required. Live acceptance is separate and needs a deliberately chosen test
 account and content.
+
+See [Contributing](CONTRIBUTING.md) for the branch, review, and PR publication workflow.
 
 ## License and credits
 

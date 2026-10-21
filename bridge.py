@@ -22,6 +22,8 @@ import image_delivery as images
 import image_receive as received_images
 import image_retention as retention
 import progress_card as progress
+import telegram_controls as controls
+import telegram_render
 
 ROOT = Path(__file__).resolve().parent
 CODEX = os.environ.get('CODEX_CLI', '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex')
@@ -103,6 +105,16 @@ def db():
         last_version INTEGER NOT NULL DEFAULT -1, last_text TEXT NOT NULL DEFAULT '',
         last_sent REAL NOT NULL DEFAULT 0, next_try REAL NOT NULL DEFAULT 0,
         disabled INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS progress_details(id TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS control_requests(id TEXT PRIMARY KEY, kind TEXT NOT NULL,
+        thread TEXT, cwd TEXT, turn TEXT, args TEXT NOT NULL, created REAL NOT NULL,
+        state TEXT NOT NULL, reply_key TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS control_results(request_id TEXT PRIMARY KEY,
+        text TEXT NOT NULL, keyboard TEXT, delivered INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS runtime_options(thread TEXT PRIMARY KEY, options TEXT NOT NULL, updated REAL NOT NULL);
+      CREATE TABLE IF NOT EXISTS job_receipts(job_id INTEGER PRIMARY KEY, receipt INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS outbox_replies(id TEXT PRIMARY KEY, receipt INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS outbox_formats(id TEXT PRIMARY KEY, html TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS reply_jobs(job_id INTEGER PRIMARY KEY, thread TEXT, cwd TEXT);
       CREATE TABLE IF NOT EXISTS keyboards(id TEXT PRIMARY KEY, markup TEXT);
       CREATE TABLE IF NOT EXISTS choices(token TEXT PRIMARY KEY, project TEXT, thread TEXT,
@@ -156,13 +168,36 @@ def progress_secrets():
         return ()
 
 
-def progress_set(c, card_id, *, now=None, **changes):
+def render_progress(c, row, now=None):
+    card = dict(row)
+    extra = c.execute('SELECT data FROM progress_details WHERE id=?',(card['id'],)).fetchone()
+    if extra:
+        try:
+            card.update(json.loads(extra['data']))
+        except (ValueError,TypeError):
+            pass
+    return progress.render(card,now=now)
+
+
+def progress_set(c, card_id, *, now=None, extra=None, merge_files=False, **changes):
     row = c.execute('SELECT * FROM progress_cards WHERE id=?', (card_id,)).fetchone()
     if not row or row['finished'] is not None:
         return False
     now = time.time() if now is None else now
     allowed = {'thread','turn','title','state','detail','event_at','finished'}
     changes = {key:value for key,value in changes.items() if key in allowed and row[key] != value}
+    if extra:
+        old = c.execute('SELECT data FROM progress_details WHERE id=?',(card_id,)).fetchone()
+        info = json.loads(old['data']) if old else {}
+        if merge_files and 'files' in extra:
+            by_path = {item['path']:item for item in info.get('files',[]) if isinstance(item,dict) and item.get('path')}
+            by_path.update({item['path']:item for item in extra['files'] if isinstance(item,dict) and item.get('path')})
+            extra = dict(extra,files=list(by_path.values())[-64:])
+        info.update(extra)
+        encoded = json.dumps(info,ensure_ascii=False)
+        if not old or encoded != old['data']:
+            c.execute('INSERT OR REPLACE INTO progress_details VALUES (?,?)',(card_id,encoded))
+            changes.setdefault('event_at',now)
     for key in ('title','detail'):
         if key in changes:
             changes[key] = progress.clean(changes[key], secrets=progress_secrets())
@@ -177,7 +212,7 @@ def progress_set(c, card_id, *, now=None, **changes):
     updated = c.execute('SELECT * FROM progress_cards WHERE id=?', (card_id,)).fetchone()
     # An unsent acknowledgement can already reflect a very fast task's final state.
     c.execute("UPDATE outbox SET text=? WHERE id=? AND state='pending'",
-              (progress.render(dict(updated), now=now),card_id))
+              (render_progress(c,updated,now=now),card_id))
     return True
 
 
@@ -200,7 +235,7 @@ def progress_begin_job(c, cfg, job_id):
               (key,job_id,job['thread'] or None,progress.clean(job['project'],secrets=progress_secrets()),
                progress.clean(title,secrets=progress_secrets()),time.time(),'queued'))
     row = c.execute('SELECT * FROM progress_cards WHERE id=?', (key,)).fetchone()
-    queue(c,key,progress.render(dict(row)))
+    queue(c,key,render_progress(c,row))
     return key
 
 
@@ -216,9 +251,12 @@ def progress_worker_update(cfg, job_id, event=None, **changes):
     try:
         if event is not None:
             detail = progress.event_detail(event,secrets=progress_secrets())
-            if not detail:
+            info = progress.event_info(event,secrets=progress_secrets())
+            if not detail and not info:
                 return
-            changes.update(detail=detail,state='running')
+            changes.update(extra=info,state='running',merge_files=event.get('method')!='turn/diff/updated')
+            if detail:
+                changes['detail'] = detail
         with db() as c:
             progress_safe(c,progress_update_job,job_id,**changes)
     except Exception:
@@ -238,10 +276,20 @@ def progress_event(c, cfg, thread, event):
         return
     kind = payload.get('type') if event.get('type') == 'event_msg' else None
     detail = progress.event_detail(event,secrets=progress_secrets())
-    if kind not in ('task_started','task_complete','turn_aborted') and not detail:
+    info = progress.event_info(event,secrets=progress_secrets())
+    if kind not in ('task_started','task_complete','turn_aborted') and not detail and not info:
         return
     passthrough = payload.get('internal_chat_message_metadata_passthrough') or {}
     turn = payload.get('turn_id') or (passthrough.get('turn_id') if isinstance(passthrough,dict) else None)
+    if kind == 'task_started' and isinstance(turn,str):
+        if stamp >= float(get(c,'progress_since',str(time.time()))) or c.execute(
+                'SELECT 1 FROM progress_cards WHERE thread=? AND turn=?',(thread,turn)).fetchone():
+            put(c,'progress-turn:'+thread,json.dumps({'turn':turn,'stamp':stamp}))
+    if not turn and info:
+        raw = get(c,'progress-turn:'+thread)
+        current = json.loads(raw) if raw else {}
+        if stamp >= current.get('stamp',float('inf')):
+            turn = current.get('turn')
     if not isinstance(turn,str) or not turn:
         return
     row = c.execute('SELECT * FROM progress_cards WHERE thread=? AND turn=?', (thread,turn)).fetchone()
@@ -280,15 +328,19 @@ def progress_event(c, cfg, thread, event):
                       (key,thread,turn,progress.clean(project,secrets=progress_secrets()),
                        progress.clean(display_title(meta),secrets=progress_secrets()),stamp,'running',stamp))
             row = c.execute('SELECT * FROM progress_cards WHERE id=?', (key,)).fetchone()
-            queue(c,key,progress.render(dict(row)))
+            queue(c,key,render_progress(c,row))
     if not row or row['finished'] is not None or stamp < max(row['started']-1,row['event_at']):
         return
     if kind in ('task_complete','turn_aborted'):
         progress_set(c,row['id'],state='ended' if kind=='task_complete' else 'cancelled',
                      finished=max(stamp,row['started']),event_at=stamp)
     else:
-        if detail:
-            progress_set(c,row['id'],state='running',detail=detail,event_at=stamp)
+        if detail or info:
+            changes = {'state':'running','event_at':stamp,'extra':info,
+                       'merge_files':event.get('method')!='turn/diff/updated'}
+            if detail:
+                changes['detail'] = detail
+            progress_set(c,row['id'],**changes)
 
 
 def refresh_progress_cards(cfg):
@@ -347,7 +399,7 @@ def deliver_progress(api, cfg, now=None):
                          (now,now-progress.CARD_INTERVAL)).fetchall()
         selected = None
         for row in rows:
-            text = progress.render(dict(row),now=now)
+            text = render_progress(c,row,now=now)
             if text != row['last_text']:
                 selected = row
                 break
@@ -546,7 +598,15 @@ def queue(c, key, text, markup=None):
             text = text.replace(token, '[Bot Token 已隐藏]')
     except OSError:
         pass
-    parts = message_parts(text)
+    try:
+        rich = config().get('rich_messages_enabled') and str(key).split(':')[0] in ('notice','last','result-backfill')
+    except (OSError,ValueError):
+        rich = False
+    try:
+        formatted = telegram_render.render_parts(text,limit=3300) if rich else None
+    except Exception:
+        formatted = None  # Optional formatting must not lose a final answer.
+    parts = [part['text'] for part in formatted] if formatted else message_parts(text)
     for index, part in enumerate(parts):
         message_id = str(key) if index == 0 else f'{key}:part:{index + 1}'
         if len(parts) > 1:
@@ -556,6 +616,11 @@ def queue(c, key, text, markup=None):
         # The first row is the idempotency marker for this complete logical notice.
         if index == 0 and not inserted:
             return
+        if formatted:
+            html = formatted[index]['html']
+            if len(parts) > 1:
+                html = f'【{index + 1}/{len(parts)}】\n' + html
+            c.execute('INSERT OR REPLACE INTO outbox_formats VALUES (?,?)',(message_id,html))
         if markup and index == len(parts) - 1:
             c.execute('INSERT OR REPLACE INTO keyboards VALUES (?,?)',
                       (message_id, json.dumps(markup, ensure_ascii=False)))
@@ -661,6 +726,8 @@ HELP = ('/projects 点选项目，可加关键词搜索\n'
         '/last 补看当前会话最近一次结果\n/new 下一条消息新建会话\n'
         '/status 查看本机正在运行的任务\n/cancel 取消待提交任务或停止 CLI 任务\n'
         '/health 查看机器人连接和通知状态\n'
+        '/steer 补充要求：追加到原会话当前回合\n/stop 停止原会话当前回合\n'
+        '/settings 调整原会话模型、推理和速度\n/usage 查看额度和上下文\n'
         '回复完成通知会定位原任务；桌面会话交给 Codex 桌面端继续。\n'
         '不回复通知时，选定项目后直接发文字即可执行。只接收绑定用户的私聊。')
 
@@ -814,6 +881,8 @@ def navigation_callback(c,cfg,callback,token):
     if not valid_menu(c,action['menu_id'],callback['message'].get('message_id')):
         return '菜单已更新或正在更新，请使用最新按钮。'
     data = json.loads(action['data'])
+    if action['kind'] == 'runtime-control':
+        return controls.callback(globals(),c,cfg,callback,action)
     key = 'navigation:' + callback['id']
     if action['kind'] == 'projects':
         project_menu(c,cfg,key,data['page'],data['query'])
@@ -934,6 +1003,7 @@ def health_text(c,cfg):
              '图片接收：'+('已启用（单张图片＋说明）' if cfg.get('image_receive_enabled') else '已停用'),
              '图片清理：'+('已启用（接收 7 天／原图 30 天，每小时检查）' if cfg.get('image_cleanup_enabled') else '已停用'),
              '执行进度卡片：'+('已启用（同一条消息，每 10 秒最多更新一次）' if cfg.get('progress_cards_enabled') else '已停用'),
+             '手机控制：'+('已启用（追加、停止、运行设置、额度）' if controls.enabled(cfg) else '已停用'),
              '上次成功接收检查：'+age('health:poll'),
              '上次成功扫描任务：'+age('health:observer'),
              '上次发送检查：'+age('health:sender'),
@@ -1230,7 +1300,7 @@ def resolve_reply(c, cfg, message):
         return None
     key = row['id'].split(':')
     thread = None
-    if len(key) >= 3 and key[0] in ('notice', 'result-backfill', 'last', 'progress'):
+    if len(key) >= 3 and key[0] in ('notice', 'result-backfill', 'last', 'progress', 'control'):
         thread = key[1]
     elif len(key) >= 2 and key[0] in ('job', 'reply'):
         try:
@@ -1261,7 +1331,7 @@ def resume_arguments(meta):
             '-c', 'sandbox_mode=' + json.dumps(modes[policy['type']])]
     if meta.get('reasoning_effort'):
         args += ['-c', 'model_reasoning_effort=' + json.dumps(meta['reasoning_effort'])]
-    return args
+    return controls.apply_arguments(args,controls.saved_options(globals(),meta['id']))
 
 
 def accept_photo(c, cfg, uid, message):
@@ -1300,6 +1370,8 @@ def accept(cfg, update):
             return select_callback(c, cfg, update['callback_query'])
         if not authorized(cfg, m):
             return
+        if isinstance(m.get('message_id'),int) and not isinstance(m.get('message_id'),bool):
+            c.execute('INSERT OR IGNORE INTO job_receipts VALUES (?,?)',(uid,m['message_id']))
         if 'photo' in m or 'media_group_id' in m:
             reply = ('这条消息已超过 15 分钟，未自动执行。请重新发送。'
                      if time.time() - m.get('date', 0) > 900 else accept_photo(c, cfg, uid, m))
@@ -1316,6 +1388,8 @@ def accept(cfg, update):
             reply = '目前只支持文字指令。'
         elif time.time() - m.get('date', 0) > 900:
             reply = '这条消息已超过 15 分钟，未自动执行。请重新发送。'
+        elif controls.accept(globals(),c,cfg,uid,m,text):
+            return
         elif text in ('/start', '/help'):
             reply = HELP
         elif text == '/use' or text == '/projects' or text.startswith('/projects '):
@@ -1402,9 +1476,13 @@ def deliver(api, cfg):
         edit=c.execute('SELECT target FROM message_edits WHERE id=?',(row['id'],)).fetchone()
         media = c.execute('SELECT * FROM outbox_media WHERE id=?', (row['id'],)).fetchone()
         card = c.execute('SELECT version FROM progress_cards WHERE id=?', (row['id'],)).fetchone()
+        quoted = c.execute('SELECT receipt FROM outbox_replies WHERE id=?',(row['id'],)).fetchone()
+        formatted = c.execute('SELECT html FROM outbox_formats WHERE id=?',(row['id'],)).fetchone()
     state, receipt, retry = 'uncertain', None, 0
     try:
         extra = {'reply_markup': json.loads(keyboard['markup'])} if keyboard else {}
+        if quoted and not edit:
+            extra['reply_parameters'] = {'message_id':quoted['receipt'],'allow_sending_without_reply':True}
         if media:
             data = images.upload_bytes(ROOT, media)
             method, field = ('sendPhoto', 'photo') if media['mode'] == 'photo' else ('sendDocument', 'document')
@@ -1415,15 +1493,32 @@ def deliver(api, cfg):
                 if media['mode'] != 'photo' or e.code != 400:
                     raise
                 # A definite photo rejection is safe to deliver as the original file.
+                reply_extra = ({'reply_parameters': extra['reply_parameters']}
+                               if 'reply_parameters' in extra else {})
                 result = api.upload('sendDocument', 'document', data, media['name'], media['mime'],
-                                    chat_id=cfg['chat_id'], caption=row['text'] + '\n预览不可用，已发送原图。')
+                                    chat_id=cfg['chat_id'], caption=row['text'] + '\n预览不可用，已发送原图。',
+                                    **reply_extra)
             receipt = result['message_id']
         elif edit:
             api.call('editMessageText',chat_id=cfg['chat_id'],message_id=edit['target'],
                      text=row['text'],reply_markup=json.loads(keyboard['markup']) if keyboard else {'inline_keyboard':[]})
             receipt=edit['target']
         else:
-            result = api.call('sendMessage', chat_id=cfg['chat_id'], text=row['text'], **extra)
+            rich = cfg.get('rich_messages_enabled') and row['id'].split(':')[0] in ('notice','last','result-backfill')
+            try:
+                parts = telegram_render.render_parts(row['text']) if rich and not formatted else None
+            except Exception:
+                parts = None
+            html = formatted['html'] if formatted and rich else parts[0]['html'] if parts and len(parts)==1 else None
+            try:
+                result = api.call('sendMessage',chat_id=cfg['chat_id'],
+                    text=html if html is not None else row['text'],
+                    **dict(extra,**({'parse_mode':'HTML'} if html is not None else {})))
+            except Rejected as error:
+                if html is None or error.code != 400:
+                    raise
+                plain = parts[0]['text'] if parts and len(parts)==1 else row['text']
+                result = api.call('sendMessage',chat_id=cfg['chat_id'],text=plain,**extra)
             receipt = result['message_id']
         state = 'sent'
     except images.ImageError:
@@ -2014,10 +2109,12 @@ def run():
             put(c,'progress_since',time.time()-1)  # Never create cards for pre-start history.
         # Interrupted jobs are never replayed automatically, including queued work.
         recover_interrupted_jobs(c,include_queued=True)
+        controls.recover(c)
     threading.Thread(target=worker_supervisor, args=(cfg,), daemon=True).start()
     def sender():
         while True:
             try:
+                controls.flush_results(globals())
                 if not deliver(api, cfg):
                     deliver_progress(api,cfg)
                 record_health('sender')
@@ -2025,6 +2122,16 @@ def run():
                 record_health('sender',error=True)
             time.sleep(1.1)
     threading.Thread(target=sender, daemon=True).start()
+    def control_worker():
+        while True:
+            try:
+                controls.deliver_next(globals(),cfg)
+                record_health('controls')
+            except Exception:
+                record_health('controls',error=True)
+            time.sleep(1)
+    if controls.enabled(cfg):
+        threading.Thread(target=control_worker,daemon=True,name='phone-controls').start()
     def watch_completions():
         while True:
             try:
@@ -2145,6 +2252,15 @@ def notify(payload, trusted=False):
         queue(c, key,
               f'【Codex】{project}{title}\n会话 {thread[:8]} · 本轮已结束\n{when}\n\n{result}')
         queue_answer_images(c, key, result, f'【Codex】{project}{title}\n会话 {thread[:8]} · {when}', completed)
+        if meta:
+            receipt = c.execute('''SELECT r.receipt FROM job_receipts r JOIN jobs j ON j.id=r.job_id
+                LEFT JOIN desktop_dispatch d ON d.job_id=j.id
+                LEFT JOIN progress_cards p ON p.job_id=j.id
+                WHERE j.thread=? AND (d.turn_id=? OR p.turn=? ) ORDER BY j.id DESC LIMIT 1''',
+                (thread,turn,turn)).fetchone()
+            if receipt:
+                for part in c.execute('SELECT id FROM outbox WHERE id=? OR id LIKE ?',(key,key+':%')).fetchall():
+                    c.execute('INSERT OR IGNORE INTO outbox_replies VALUES (?,?)',(part['id'],receipt['receipt']))
 
 
 def baseline_completions():
@@ -2211,9 +2327,8 @@ def scan_completions():
                         continue
                     payload = event.get('payload', {})
                     if (cfg.get('progress_cards_enabled') and isinstance(payload,dict) and
-                            ((event.get('type')=='event_msg' and (payload.get('type') in ('task_started','task_complete','turn_aborted')
-                             or (payload.get('type')=='agent_message' and payload.get('phase')=='commentary')))
-                             or (event.get('type')=='response_item' and payload.get('role')=='assistant' and payload.get('phase')=='commentary'))):
+                            ((event.get('type')=='event_msg' and payload.get('type') in ('task_started','task_complete','turn_aborted'))
+                             or progress.event_detail(event,secrets=progress_secrets()) or progress.event_info(event,secrets=progress_secrets()))):
                         with db() as c:
                             progress_safe(c,progress_event,cfg,thread,event)
                     if event.get('type') == 'event_msg' and payload.get('type') == 'task_complete':
